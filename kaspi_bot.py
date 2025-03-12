@@ -23,12 +23,12 @@ from flask import Flask, request
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
+# Инициализация Flask
+app = Flask(__name__)
+
 # Инициализация бота
 API_KEY = '7254752385:AAFQm2J7z2_GhpowoD9QGTAAEk7u90NFjtw'  # Замените на ваш API-ключ
 bot = telebot.TeleBot(API_KEY)
-
-# Инициализация Flask
-app = Flask(__name__)
 
 # Устанавливаем меню команд
 commands = [
@@ -561,6 +561,11 @@ def webhook():
     update = telebot.types.Update.de_json(request.stream.read().decode('utf-8'))
     bot.process_new_updates([update])
     return 'ok', 200
+
+# Обработчик для корневого URL
+@app.route('/')
+def home():
+    return "Telegram Bot is running!", 200
 
 # Запуск Flask-приложения
 if __name__ == '__main__':
