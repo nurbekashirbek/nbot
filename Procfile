@@ -1,1 +1,1 @@
-"worker: python3 kaspi_bot.py" 
+"worker: python kaspi_bot.py" 
