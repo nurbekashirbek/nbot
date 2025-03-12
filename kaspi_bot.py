@@ -18,6 +18,7 @@ import base64
 import os
 import threading
 from telebot.types import BotCommand
+from flask import Flask, request
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +26,9 @@ logging.basicConfig(level=logging.INFO)
 # Инициализация бота
 API_KEY = '7254752385:AAFQm2J7z2_GhpowoD9QGTAAEk7u90NFjtw'  # Замените на ваш API-ключ
 bot = telebot.TeleBot(API_KEY)
+
+# Инициализация Flask
+app = Flask(__name__)
 
 # Устанавливаем меню команд
 commands = [
@@ -49,7 +53,6 @@ def send_long_message(chat_id, message):
         message = message[max_message_length:]
     bot.send_message(chat_id, message)
 
-# Функция для получения диапазона дат
 # Функция для получения диапазона дат
 def get_date_range():
     today = datetime.now(UTC_PLUS_5)  # Текущее время в UTC+5
@@ -499,7 +502,7 @@ def send_pending_report(message):
         # Создаем Excel и отправляем его по email
         file_name = create_excel(pending_orders_by_store, sheet_name="Pending Orders")
         email_body = (
-            "Доброе утро,высылаю количество заказов ожидающие передачи курьеру. "
+            "Доброе утро, высылаю количество заказов, ожидающих передачи курьеру. "
             "Прошу обратить внимание на эти заказы!"
         )
         send_email(file_name, subject="Отчет по заказам, ожидающим передачи", email_body=email_body)
@@ -552,9 +555,14 @@ scheduler_thread = threading.Thread(target=run_scheduler)
 scheduler_thread.daemon = True  # Поток завершится, если основной поток завершится
 scheduler_thread.start()
 
-# Запуск бота
+# Вебхук для обработки запросов от Telegram
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    update = telebot.types.Update.de_json(request.stream.read().decode('utf-8'))
+    bot.process_new_updates([update])
+    return 'ok', 200
+
+# Запуск Flask-приложения
 if __name__ == '__main__':
-    try:
-        bot.polling(none_stop=True, interval=0)  # Запуск бота
-    except Exception as e:
-        logging.error(f"Ошибка в основном цикле: {e}")
+    port = int(os.environ.get('PORT', 10000))  # Используем порт из переменной окружения
+    app.run(host='0.0.0.0', port=port)  # Привязываемся к 0.0.0.0 и порту
