@@ -6,3 +6,4 @@ openpyxl==3.1.2
 matplotlib==3.7.1
 pandas==2.0.3
 pyTelegramBotAPI
+numpy<2.0
