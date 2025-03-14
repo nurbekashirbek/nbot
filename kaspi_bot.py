@@ -477,7 +477,7 @@ def send_report(message):
             "Добрый вечер, остались заказы, которые должны были быть переданы сегодня курьеру. "
             "Прошу вывести эти заказы и передать, это портит статистику своевременных передач."
         )
-        send_email(file_name, subject="Задержанные заказы", email_body=email_body)
+        send_email(file_name, subject="Задержанные заказы OMS", email_body=email_body)
 
         bot.send_message(message.chat.id, '✅ Отчет успешно отправлен по электронной почте.')
 
@@ -503,7 +503,7 @@ def send_pending_report(message):
             "Доброе утро, высылаю количество заказов ожидающих передачи курьеру сегодня!"
             "Прошу вывести все заказы до прихода курьера)"
         )
-        send_email(file_name, subject="Ожидающие заказы", email_body=email_body)
+        send_email(file_name, subject="Ожидающие заказы OMS", email_body=email_body)
 
         bot.send_message(message.chat.id, '✅ Отчет успешно отправлен по электронной почте.')
 
@@ -521,7 +521,7 @@ def job_overdue():
             "Добрый вечер, остались заказы, которые должны были быть переданы сегодня курьеру. "
             "Прошу вывести эти заказы и передать, это портит статистику своевременных передач."
         )
-        send_email(file_name, subject="Задержанные заказы", email_body=email_body)
+        send_email(file_name, subject="Задержанные заказы OMS", email_body=email_body)
 
 # Авторассылка в 10 утра для заказов, ожидающих передачи
 def job_pending():
@@ -533,11 +533,11 @@ def job_pending():
             "Доброе утро, высылаю количество заказов ожидающих передачи курьеру сегодня!"
             "Прошу вывести все заказы до прихода курьера)"
         )
-        send_email(file_name, subject="Ожидающие заказы", email_body=email_body)
+        send_email(file_name, subject="Ожидающие заказы OMS", email_body=email_body)
 
 # Планирование задач в UTC+5
-schedule.every().day.at("04:59").do(job_overdue)  # по UTC+5 
-schedule.every().day.at("12:59").do(job_pending)  # по UTC+5
+schedule.every().day.at("12:59").do(job_overdue)  # по UTC+5 
+schedule.every().day.at("04:59").do(job_pending)  # по UTC+5
 
 def run_scheduler():
     while True:
