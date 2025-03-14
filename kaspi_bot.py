@@ -537,8 +537,8 @@ def job_pending():
         send_email(file_name, subject="Отчет по заказам, ожидающим передачи", email_body=email_body)
 
 # Планирование задач в UTC+5
-schedule.every().day.at("21:05").do(job_overdue)  # по UTC+5
-schedule.every().day.at("21:02").do(job_pending)  # по UTC+5
+schedule.every().day.at("21:10").do(job_overdue)  # по UTC+5
+schedule.every().day.at("21:15").do(job_pending)  # по UTC+5
 
 def run_scheduler():
     while True:
