@@ -251,7 +251,7 @@ def create_excel(orders_by_store, sheet_name="Orders"):
 # Функция для создания скриншота таблицы
 def create_table_screenshot(df, filename):
     # Настройка размера фигуры в зависимости от количества строк
-    fig, ax = plt.subplots(figsize=(7, max(4, len(df) * 0.4)))  # Ширина 7, высота зависит от количества строк
+    fig, ax = plt.subplots(figsize=(7, max(2, len(df) * 0.4)))  # Ширина 7, высота зависит от количества строк
     ax.axis('off')  # Отключаем оси
 
     # Создаем таблицу
@@ -262,8 +262,8 @@ def create_table_screenshot(df, filename):
         loc='center'
     )
     table.auto_set_font_size(False)  # Отключаем автоматический подбор размера шрифта
-    table.set_fontsize(13)  # Устанавливаем размер шрифта
-    table.scale(1, 2)  # Масштабируем таблицу (ширина, высота)
+    table.set_fontsize(12)  # Устанавливаем размер шрифта
+    table.scale(1, 1.5)  # Масштабируем таблицу (ширина, высота)
 
     # Убираем лишние отступы
     plt.tight_layout()
@@ -287,8 +287,12 @@ def create_statistics_screenshot(file_name):
 def send_email(file_name, subject, email_body):
     try:
         from_email = 'nurbek.ashirbek@flo.com.tr'
-        to_email = '31370@iitu.edu.kz'
-        cc_emails = ['9041@flo.com.tr', 'nurbek.a2003@gmail.com']
+	to_email = ['9003@flo.com.tr', '9004@flo.com.tr', '9005@flo.com.tr', 
+            '9006@flo.com.tr', '9020@flo.com.tr', '9041@flo.com.tr', 
+            '9077@flo.com.tr', '9078@flo.com.tr', '9080@flo.com.tr', 
+            '9104@flo.com.tr']
+
+        cc_emails = ['nurbek.oralbek@flo.com.tr','askar.muhanbetkaliev@flo.com.tr','arailym.bakytkereyeva@flo.com.tr','Ruslan.Niyaz@flo.com.tr']
 
         # Создаем скриншот листа "Statistics"
         screenshot_filename = create_statistics_screenshot(file_name)
@@ -297,10 +301,11 @@ def send_email(file_name, subject, email_body):
         with open(screenshot_filename, "rb") as img_file:
             img_base64 = base64.b64encode(img_file.read()).decode('utf-8')
         
+        # Создаем письмо
         msg = MIMEMultipart('alternative')
-        msg['From'] = from_email
-        msg['To'] = to_email
-        msg['Cc'] = ', '.join(cc_emails)
+        msg['From'] = 'Nurbek ASHIRBEK <nurbek.ashirbek@flo.com.tr>'
+        msg['To'] = ', '.join(to_email)  # Преобразуем список в строку
+        msg['Cc'] = ', '.join(cc_emails)  # Преобразуем список в строку
         msg['Subject'] = subject
 
         # HTML с изображением
@@ -308,7 +313,7 @@ def send_email(file_name, subject, email_body):
         <html>
             <body>
                 <p>{email_body}</p>
-                <img src="data:image/png;base64,{img_base64}" alt="Statistics Table" style="width: 100%; max-width: 800px;" />
+                <img src="data:image/png;base64,{img_base64}" alt="Statistics Table" style="width: 100%; max-width: 500px;" />
                 <p>С уважением,</p>
             </body>
         </html>
@@ -332,7 +337,7 @@ def send_email(file_name, subject, email_body):
         server.starttls()
         server.login(from_email, 'cPzbY6@4')
 
-        all_recipients = [to_email] + cc_emails
+        all_recipients = to_email + cc_emails  # Объединяем списки
         server.sendmail(from_email, all_recipients, msg.as_string())
         server.quit()
 
