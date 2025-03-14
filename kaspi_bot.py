@@ -1,3 +1,4 @@
+import os
 import requests
 import logging
 from datetime import datetime, timedelta, timezone
@@ -15,15 +16,15 @@ from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from io import BytesIO
 import base64
-import os
 import threading
 from telebot.types import BotCommand
+from flask import Flask, request
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
 # Инициализация бота
-API_KEY = '8117465985:AAFiQzHyQaJYuzKTKbuRVRr3vZm2kDprVMA'  # Замените на ваш API-ключ
+API_KEY = os.getenv('TELEGRAM_API_KEY')  # Используем переменную окружения
 bot = telebot.TeleBot(API_KEY)
 
 # Устанавливаем меню команд
@@ -50,7 +51,6 @@ def send_long_message(chat_id, message):
     bot.send_message(chat_id, message)
 
 # Функция для получения диапазона дат
-# Функция для получения диапазона дат
 def get_date_range():
     today = datetime.now(UTC_PLUS_5)  # Текущее время в UTC+5
     start_date = today - timedelta(days=14)  # За последние 14 дней
@@ -74,7 +74,7 @@ def get_overdue_orders():
         }
 
         headers = {
-            'X-Auth-Token': 'lnUW8+JGAS2eZT7l8cSo4Np+jdvxXVxTbZ0v2OTZbvY=',
+            'X-Auth-Token': os.getenv('KASPI_AUTH_TOKEN'),  # Используем переменную окружения
             'User-Agent': 'PostmanRuntime/7.32.0',
             'Accept': 'application/vnd.api+json;charset=UTF-8',
             'Connection': 'keep-alive'
@@ -156,7 +156,7 @@ def get_pending_orders():
         }
 
         headers = {
-            'X-Auth-Token': 'lnUW8+JGAS2eZT7l8cSo4Np+jdvxXVxTbZ0v2OTZbvY=',
+            'X-Auth-Token': os.getenv('KASPI_AUTH_TOKEN'),  # Используем переменную окружения
             'User-Agent': 'PostmanRuntime/7.32.0',
             'Accept': 'application/vnd.api+json;charset=UTF-8',
             'Connection': 'keep-alive'
@@ -286,10 +286,9 @@ def create_statistics_screenshot(file_name):
 # Функция для отправки email
 def send_email(file_name, subject, email_body):
     try:
-        from_email = 'nurbek.ashirbek@flo.com.tr'
-        to_email = ['9041@flo.com.tr']
-
-        cc_emails = ['31370@iitu.edu.kz']
+        from_email = os.getenv('EMAIL_FROM')  # Используем переменную окружения
+        to_email = os.getenv('EMAIL_TO').split(',')  # Используем переменную окружения
+        cc_emails = os.getenv('EMAIL_CC').split(',')  # Используем переменную окружения
 
         # Создаем скриншот листа "Statistics"
         screenshot_filename = create_statistics_screenshot(file_name)
@@ -300,7 +299,7 @@ def send_email(file_name, subject, email_body):
         
         # Создаем письмо
         msg = MIMEMultipart('alternative')
-        msg['From'] = 'Nurbek ASHIRBEK <nurbek.ashirbek@flo.com.tr>'
+        msg['From'] = f'Nurbek ASHIRBEK <{from_email}>'
         msg['To'] = ', '.join(to_email)  # Преобразуем список в строку
         msg['Cc'] = ', '.join(cc_emails)  # Преобразуем список в строку
         msg['Subject'] = subject
@@ -332,7 +331,7 @@ def send_email(file_name, subject, email_body):
         # Отправка письма
         server = smtplib.SMTP('smtp.office365.com', 587)
         server.starttls()
-        server.login(from_email, 'cPzbY6@4')
+        server.login(from_email, os.getenv('EMAIL_PASSWORD'))  # Используем переменную окружения
 
         all_recipients = to_email + cc_emails  # Объединяем списки
         server.sendmail(from_email, all_recipients, msg.as_string())
@@ -537,8 +536,8 @@ def job_pending():
         send_email(file_name, subject="Отчет по заказам, ожидающим передачи", email_body=email_body)
 
 # Планирование задач в UTC+5
-schedule.every().day.at("21:10").do(job_overdue)  # по UTC+5
-schedule.every().day.at("21:15").do(job_pending)  # по UTC+5
+schedule.every().day.at("21:40").do(job_overdue)  # по UTC+5
+schedule.every().day.at("21:45").do(job_pending)  # по UTC+5
 
 def run_scheduler():
     while True:
@@ -554,9 +553,28 @@ scheduler_thread = threading.Thread(target=run_scheduler)
 scheduler_thread.daemon = True  # Поток завершится, если основной поток завершится
 scheduler_thread.start()
 
+# Инициализация Flask приложения
+app = Flask(__name__)
+
+@app.route('/' + API_KEY, methods=['POST'])
+def webhook():
+    update = telebot.types.Update.de_json(request.stream.read().decode('utf-8'))
+    bot.process_new_updates([update])
+    return 'ok', 200
+
+@app.route('/')
+def index():
+    return 'Hello, World!'
+
 # Запуск бота
 if __name__ == '__main__':
     try:
-        bot.polling(none_stop=True, interval=0)  # Запуск бота
+        # Устанавливаем вебхук
+        bot.remove_webhook()
+        bot.set_webhook(url=f'https://nbot-n94j.onrender.com/{API_KEY}')
+        
+        # Запускаем Flask приложение
+        port = int(os.environ.get('PORT', 5000))
+        app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
