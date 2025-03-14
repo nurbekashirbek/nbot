@@ -23,7 +23,7 @@ from telebot.types import BotCommand
 logging.basicConfig(level=logging.INFO)
 
 # Инициализация бота
-API_KEY = '7254752385:AAFQm2J7z2_GhpowoD9QGTAAEk7u90NFjtw'  # Замените на ваш API-ключ
+API_KEY = '8117465985:AAFiQzHyQaJYuzKTKbuRVRr3vZm2kDprVMA'  # Замените на ваш API-ключ
 bot = telebot.TeleBot(API_KEY)
 
 # Устанавливаем меню команд
@@ -287,17 +287,9 @@ def create_statistics_screenshot(file_name):
 def send_email(file_name, subject, email_body):
     try:
         from_email = 'nurbek.ashirbek@flo.com.tr'
-        to_email = [
-            '9003@flo.com.tr', '9004@flo.com.tr', '9005@flo.com.tr', 
-            '9006@flo.com.tr', '9020@flo.com.tr', '9041@flo.com.tr', 
-            '9077@flo.com.tr', '9078@flo.com.tr', '9080@flo.com.tr', 
-            '9104@flo.com.tr'
-        ]
+        to_email = ['9041@flo.com.tr']
 
-        cc_emails = [
-            'nurbek.oralbek@flo.com.tr', 'askar.muhanbetkaliev@flo.com.tr', 
-            'arailym.bakytkereyeva@flo.com.tr', 'Ruslan.Niyaz@flo.com.tr'
-        ]
+        cc_emails = ['31370@iitu.edu.kz']
 
         # Создаем скриншот листа "Statistics"
         screenshot_filename = create_statistics_screenshot(file_name)
@@ -545,8 +537,8 @@ def job_pending():
         send_email(file_name, subject="Отчет по заказам, ожидающим передачи", email_body=email_body)
 
 # Планирование задач в UTC+5
-schedule.every().day.at("16:58").do(job_overdue)  # по UTC+5
-schedule.every().day.at("09:58").do(job_pending)  # по UTC+5
+schedule.every().day.at("21:05").do(job_overdue)  # по UTC+5
+schedule.every().day.at("21:02").do(job_pending)  # по UTC+5
 
 def run_scheduler():
     while True:
