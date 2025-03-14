@@ -287,12 +287,17 @@ def create_statistics_screenshot(file_name):
 def send_email(file_name, subject, email_body):
     try:
         from_email = 'nurbek.ashirbek@flo.com.tr'
-	to_email = ['9003@flo.com.tr', '9004@flo.com.tr', '9005@flo.com.tr', 
+        to_email = [
+            '9003@flo.com.tr', '9004@flo.com.tr', '9005@flo.com.tr', 
             '9006@flo.com.tr', '9020@flo.com.tr', '9041@flo.com.tr', 
             '9077@flo.com.tr', '9078@flo.com.tr', '9080@flo.com.tr', 
-            '9104@flo.com.tr']
+            '9104@flo.com.tr'
+        ]
 
-        cc_emails = ['nurbek.oralbek@flo.com.tr','askar.muhanbetkaliev@flo.com.tr','arailym.bakytkereyeva@flo.com.tr','Ruslan.Niyaz@flo.com.tr']
+        cc_emails = [
+            'nurbek.oralbek@flo.com.tr', 'askar.muhanbetkaliev@flo.com.tr', 
+            'arailym.bakytkereyeva@flo.com.tr', 'Ruslan.Niyaz@flo.com.tr'
+        ]
 
         # Создаем скриншот листа "Statistics"
         screenshot_filename = create_statistics_screenshot(file_name)
