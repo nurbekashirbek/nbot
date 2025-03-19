@@ -474,10 +474,11 @@ def send_report(message):
         # Создаем Excel и отправляем его по email
         file_name = create_excel(overdue_orders_by_store, sheet_name="Overdue Orders")
         email_body = (
-            "Добрый вечер, остались заказы, которые должны были быть переданы сегодня курьеру. "
-            "Прошу вывести эти заказы и передать, это портит статистику своевременных передач."
+            "Good evening, There are delayed orders that were supposed to be handed over to the courier today. "
+            "Please find these orders.\n\n"
+            "Қайырлы кеш, Төменде кешіккен тапсырыс саны."
         )
-        send_email(file_name, subject="Задержанные заказы OMS", email_body=email_body)
+        send_email(file_name, subject="Delayed orders OMS", email_body=email_body)
 
         bot.send_message(message.chat.id, '✅ Отчет успешно отправлен по электронной почте.')
 
@@ -500,10 +501,10 @@ def send_pending_report(message):
         # Создаем Excel и отправляем его по email
         file_name = create_excel(pending_orders_by_store, sheet_name="Pending Orders")
         email_body = (
-            "Доброе утро, высылаю количество заказов ожидающих передачи курьеру сегодня!"
-            "Прошу вывести все заказы до прихода курьера)"
+            "Қайырлы таң, Төменде бүгін курьерге жіберілуі керек тапсырыс саны.\n\n"
+            "Good morning, Attached are all the pending orders for courier handover today." 
         )
-        send_email(file_name, subject="Ожидающие заказы OMS", email_body=email_body)
+        send_email(file_name, subject="Pending orders OMS", email_body=email_body)
 
         bot.send_message(message.chat.id, '✅ Отчет успешно отправлен по электронной почте.')
 
@@ -518,10 +519,11 @@ def job_overdue():
     if overdue_orders_by_store:
         file_name = create_excel(overdue_orders_by_store, sheet_name="Overdue Orders")
         email_body = (
-            "Добрый вечер, остались заказы, которые должны были быть переданы сегодня курьеру. "
-            "Прошу вывести эти заказы и передать, это портит статистику своевременных передач."
+            "Good evening, There are delayed orders that were supposed to be handed over to the courier today. "
+            "Please find these orders.\n\n"
+            "Қайырлы кеш, Төменде кешіккен тапсырыс саны."
         )
-        send_email(file_name, subject="Задержанные заказы OMS", email_body=email_body)
+        send_email(file_name, subject="Delayed orders OMS", email_body=email_body)
 
 # Авторассылка в 10 утра для заказов, ожидающих передачи
 def job_pending():
@@ -530,10 +532,10 @@ def job_pending():
     if pending_orders_by_store:
         file_name = create_excel(pending_orders_by_store, sheet_name="Pending Orders")
         email_body = (
-            "Доброе утро, высылаю количество заказов ожидающих передачи курьеру сегодня!"
-            "Прошу вывести все заказы до прихода курьера)"
+            "Қайырлы таң, Төменде бүгін курьерге жіберілуі керек тапсырыс саны.\n\n"
+            "Good morning, Attached are all the pending orders for courier handover today." 
         )
-        send_email(file_name, subject="Ожидающие заказы OMS", email_body=email_body)
+        send_email(file_name, subject="Pending orders OMS", email_body=email_body)
 
 # Планирование задач в UTC+5
 schedule.every().day.at("12:59").do(job_overdue)  # по UTC+5 
