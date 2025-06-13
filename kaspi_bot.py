@@ -43,6 +43,20 @@ API_URL = 'https://kaspi.kz/shop/api/v2/orders'
 # Таймзона UTC+5
 UTC_PLUS_5 = timezone(timedelta(hours=5))
 
+# Словарь для замены кодов магазинов на читаемые названия
+store_mapping = {
+    "14576033_9005": "Магазин 1",
+    "14576033_9020": "Магазин 2",
+    "14576033_9003": "Магазин 3",
+    "14576033_9080": "Магазин 4",
+    "14576033_9078": "Магазин 5",
+    "14576033_9077": "Магазин 6",
+    "14576033_9004": "Магазин 7",
+    "14576033_9104": "Магазин 8",
+    "14576033_9006": "Магазин 9",
+    "Итого": "Total"
+}
+
 def send_long_message(chat_id, message):
     max_message_length = 4096
     while len(message) > max_message_length:
@@ -115,6 +129,8 @@ def get_overdue_orders():
             for order in data['data']:
                 order_code = order['attributes'].get('code', 'Нет номера заказа')
                 pickup_point = order['attributes'].get('pickupPointId', 'Неизвестный магазин')
+                # Замена значения магазина из словаря, если ключ есть, иначе исходное значение
+                pickup_point = store_mapping.get(pickup_point, pickup_point)
                 courier_transmission_planning_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionPlanningDate')
                 courier_transmission_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionDate')
 
@@ -198,6 +214,8 @@ def get_pending_orders():
             for order in data['data']:
                 order_code = order['attributes'].get('code', 'Нет номера заказа')
                 pickup_point = order['attributes'].get('pickupPointId', 'Неизвестный магазин')
+                # Замена значения магазина из словаря, если ключ есть, иначе исходное значение
+                pickup_point = store_mapping.get(pickup_point, pickup_point)
                 courier_transmission_planning_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionPlanningDate')
                 courier_transmission_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionDate')
 
