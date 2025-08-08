@@ -320,7 +320,11 @@ def send_email(file_name, subject, email_body):
                 <body>
                     <p>{email_body}</p>
                     <img src="data:image/png;base64,{img_base64}" alt="Statistics Table" style="width: 100%; max-width: 500px;" />
-                    <p>С уважением,</p>
+                    <p style="margin-top: 20px;">С уважением,</p>
+                    <p>
+                        <span style="color: #FFA500; font-weight: bold;">Nurbek Ashirbek</span><br>
+                        <span style="color: #000000;">E-commerce specialist</span>
+                    </p>
                 </body>
             </html>
             '''
@@ -592,6 +596,7 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
+
 
 
 
