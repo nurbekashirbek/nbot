@@ -336,7 +336,7 @@ def send_email(file_name, subject, email_body):
                 img_attachment.add_header('Content-Disposition', 'attachment', filename=screenshot_filename)
                 msg.attach(img_attachment)
 
-            server = smtplib.SMTP('smtp.office365.com', 587)
+            server = smtplib.SMTP('smtp.yandex.com', 587)
             server.starttls()
             server.login(from_email, os.getenv('EMAIL_PASSWORD'))
 
@@ -592,5 +592,6 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
+
 
 
