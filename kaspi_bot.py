@@ -192,7 +192,7 @@ def get_pending_orders():
             while attempt <= max_attempts:
                 try:
                     response = requests.get(API_URL, params=params, headers=headers)
-                    logging.info(f'Ответ API: {response.status_code}')
+                    logging.info(f'Ответ API на странице {page_number}: {response.status_code}')
                     response.raise_for_status()
                     break
                 except requests.exceptions.ConnectionError as e:
@@ -209,7 +209,7 @@ def get_pending_orders():
                 logging.info("Нет данных на текущей странице")
                 break
 
-            logging.info(f"На странице {page_number} заказов: {len(data['data'])}")
+            logging.info(f"На странице {page_number} найдено заказов: {len(data['data'])}")
 
             for order in data['data']:
                 order_code = order['attributes'].get('code', 'Нет номера заказа')
@@ -218,12 +218,23 @@ def get_pending_orders():
                 courier_transmission_planning_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionPlanningDate')
                 courier_transmission_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionDate')
 
+                # Логирование для точки 9041
+                if pickup_point == store_mapping.get("14576033_9041", "Almaty Warehouse"):
+                    logging.info(f"Обнаружен заказ для точки 14576033_9041 (Almaty Warehouse): {order_code}")
+                    if courier_transmission_planning_date:
+                        planned_date = datetime.fromtimestamp(courier_transmission_planning_date / 1000, tz=UTC_PLUS_5)
+                        logging.info(f"  - Планируемая дата передачи: {planned_date}")
+                    else:
+                        logging.info(f"  - Планируемая дата передачи: отсутствует")
+                    logging.info(f"  - Фактическая дата передачи: {'отсутствует' if courier_transmission_date is None else datetime.fromtimestamp(courier_transmission_date / 1000, tz=UTC_PLUS_5)}")
+
                 # Для точки 9041 (Almaty Warehouse) берем все заказы без фильтра по дате планируемой передачи
                 if pickup_point == store_mapping.get("14576033_9041", "Almaty Warehouse"):
                     if courier_transmission_date is None:
                         if pickup_point not in pending_orders_by_store:
                             pending_orders_by_store[pickup_point] = []
                         pending_orders_by_store[pickup_point].append(order_code)
+                        logging.info(f"  - Заказ {order_code} добавлен для Almaty Warehouse (без фильтра по дате)")
                 else:
                     # Для остальных точек фильтруем по дате планируемой передачи на сегодня
                     if courier_transmission_planning_date:
@@ -232,11 +243,18 @@ def get_pending_orders():
                             if pickup_point not in pending_orders_by_store:
                                 pending_orders_by_store[pickup_point] = []
                             pending_orders_by_store[pickup_point].append(order_code)
+                            logging.info(f"  - Заказ {order_code} добавлен для {pickup_point} (фильтр по дате: {planned_date})")
 
             if len(data['data']) < params['page[size]']:
                 break
             else:
                 page_number += 1
+
+        # Логирование итогов для Almaty Warehouse
+        almaty_warehouse_orders = pending_orders_by_store.get(store_mapping.get("14576033_9041", "Almaty Warehouse"), [])
+        logging.info(f"Итоговое количество заказов для Almaty Warehouse: {len(almaty_warehouse_orders)}")
+        if almaty_warehouse_orders:
+            logging.info(f"Коды заказов для Almaty Warehouse: {', '.join(almaty_warehouse_orders)}")
 
         logging.info(f"Найдено заказов, ожидающих передачи: {sum(len(orders) for orders in pending_orders_by_store.values())}")
         return pending_orders_by_store
@@ -602,3 +620,4 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
+
