@@ -161,6 +161,8 @@ def get_pending_orders():
         start_date, today = get_date_range()
         start_of_day = today.replace(hour=0, minute=0, second=0, microsecond=0)
         end_of_day = today.replace(hour=23, minute=59, second=59, microsecond=0)
+        # Добавляем end_of_week для точки 14576033_9041 (Almaty Warehouse)
+        end_of_week = today + timedelta(days=7)
 
         params = {
             'page[number]': 0,
@@ -222,10 +224,19 @@ def get_pending_orders():
 
                 if courier_transmission_planning_date:
                     planned_date = datetime.fromtimestamp(courier_transmission_planning_date / 1000, tz=UTC_PLUS_5)
-                    if start_date <= planned_date <= end_of_day and courier_transmission_date is None:
-                        if pickup_point not in pending_orders_by_store:
-                            pending_orders_by_store[pickup_point] = []
-                        pending_orders_by_store[pickup_point].append(order_code)
+                    # Специальная логика для точки 14576033_9041 (Almaty Warehouse)
+                    if pickup_point == store_mapping.get("14576033_9041", "Almaty Warehouse"):
+                        # Заказы с planned_date в диапазоне от start_date до end_of_week
+                        if start_date <= planned_date <= end_of_week and courier_transmission_date is None:
+                            if pickup_point not in pending_orders_by_store:
+                                pending_orders_by_store[pickup_point] = []
+                            pending_orders_by_store[pickup_point].append(order_code)
+                    else:
+                        # Обычная логика для остальных точек: заказы только на текущий день
+                        if start_of_day <= planned_date <= end_of_day and courier_transmission_date is None:
+                            if pickup_point not in pending_orders_by_store:
+                                pending_orders_by_store[pickup_point] = []
+                            pending_orders_by_store[pickup_point].append(order_code)
 
             if len(data['data']) < params['page[size]']:
                 break
@@ -596,9 +607,3 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
-
-
-
-
-
-
