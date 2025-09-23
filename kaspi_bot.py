@@ -21,14 +21,7 @@ from telebot.types import BotCommand
 from flask import Flask, request
 
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
-)
+logging.basicConfig(level=logging.INFO)
 
 # Инициализация бота
 API_KEY = os.getenv('TELEGRAM_API_KEY')
@@ -61,6 +54,7 @@ store_mapping = {
     "14576033_9004": "Shym Bayan Sulu",
     "14576033_9104": "Astana Reebok",
     "14576033_9006": "Astana Asia Park",
+    "14576033_9041": "Almaty Warehouse",
     "Итого": "Total"
 }
 
@@ -198,7 +192,7 @@ def get_pending_orders():
             while attempt <= max_attempts:
                 try:
                     response = requests.get(API_URL, params=params, headers=headers)
-                    logging.info(f'Ответ API на странице {page_number}: {response.status_code}')
+                    logging.info(f'Ответ API: {response.status_code}')
                     response.raise_for_status()
                     break
                 except requests.exceptions.ConnectionError as e:
@@ -215,35 +209,21 @@ def get_pending_orders():
                 logging.info("Нет данных на текущей странице")
                 break
 
-            logging.info(f"На странице {page_number} найдено заказов: {len(data['data'])}")
+            logging.info(f"На странице {page_number} заказов: {len(data['data'])}")
 
             for order in data['data']:
                 order_code = order['attributes'].get('code', 'Нет номера заказа')
                 pickup_point = order['attributes'].get('pickupPointId', 'Неизвестный магазин')
-                # Применяем store_mapping для всех точек, кроме 14576033_9041
-                if pickup_point != "14576033_9041":
-                    pickup_point = store_mapping.get(pickup_point, pickup_point)
-                
+                pickup_point = store_mapping.get(pickup_point, pickup_point)
                 courier_transmission_planning_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionPlanningDate')
                 courier_transmission_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionDate')
 
-                # Логирование для точки 14576033_9041
-                if pickup_point == "14576033_9041":
-                    logging.info(f"Обнаружен заказ для точки 14576033_9041: {order_code}")
-                    if courier_transmission_planning_date:
-                        planned_date = datetime.fromtimestamp(courier_transmission_planning_date / 1000, tz=UTC_PLUS_5)
-                        logging.info(f"  - Планируемая дата передачи: {planned_date}")
-                    else:
-                        logging.info(f"  - Планируемая дата передачи: отсутствует")
-                    logging.info(f"  - Фактическая дата передачи: {'отсутствует' if courier_transmission_date is None else datetime.fromtimestamp(courier_transmission_date / 1000, tz=UTC_PLUS_5)}")
-
-                # Для точки 14576033_9041 берем все заказы без фильтра по дате планируемой передачи
-                if pickup_point == "14576033_9041":
+                # Для точки 9041 (Almaty Warehouse) берем все заказы без фильтра по дате планируемой передачи
+                if pickup_point == store_mapping.get("14576033_9041", "Almaty Warehouse"):
                     if courier_transmission_date is None:
                         if pickup_point not in pending_orders_by_store:
                             pending_orders_by_store[pickup_point] = []
                         pending_orders_by_store[pickup_point].append(order_code)
-                        logging.info(f"  - Заказ {order_code} добавлен для точки 14576033_9041 (без фильтра по дате)")
                 else:
                     # Для остальных точек фильтруем по дате планируемой передачи на сегодня
                     if courier_transmission_planning_date:
@@ -252,18 +232,11 @@ def get_pending_orders():
                             if pickup_point not in pending_orders_by_store:
                                 pending_orders_by_store[pickup_point] = []
                             pending_orders_by_store[pickup_point].append(order_code)
-                            logging.info(f"  - Заказ {order_code} добавлен для {pickup_point} (фильтр по дате: {planned_date})")
 
             if len(data['data']) < params['page[size]']:
                 break
             else:
                 page_number += 1
-
-        # Логирование итогов для точки 14576033_9041
-        almaty_warehouse_orders = pending_orders_by_store.get("14576033_9041", [])
-        logging.info(f"Итоговое количество заказов для точки 14576033_9041: {len(almaty_warehouse_orders)}")
-        if almaty_warehouse_orders:
-            logging.info(f"Коды заказов для точки 14576033_9041: {', '.join(almaty_warehouse_orders)}")
 
         logging.info(f"Найдено заказов, ожидающих передачи: {sum(len(orders) for orders in pending_orders_by_store.values())}")
         return pending_orders_by_store
