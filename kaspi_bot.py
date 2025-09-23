@@ -130,7 +130,6 @@ def get_overdue_orders():
             for order in data['data']:
                 order_code = order['attributes'].get('code', 'Нет номера заказа')
                 pickup_point = order['attributes'].get('pickupPointId', 'Неизвестный магазин')
-                # Замена значения магазина из словаря, если ключ есть, иначе исходное значение
                 pickup_point = store_mapping.get(pickup_point, pickup_point)
                 courier_transmission_planning_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionPlanningDate')
                 courier_transmission_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionDate')
@@ -161,8 +160,6 @@ def get_pending_orders():
         start_date, today = get_date_range()
         start_of_day = today.replace(hour=0, minute=0, second=0, microsecond=0)
         end_of_day = today.replace(hour=23, minute=59, second=59, microsecond=0)
-        # Добавляем end_of_week для точки 14576033_9041 (Almaty Warehouse) - конец дня +7 дней вперед
-        end_of_week = (today + timedelta(days=7)).replace(hour=23, minute=59, second=59, microsecond=0)
 
         params = {
             'page[number]': 0,
@@ -217,24 +214,20 @@ def get_pending_orders():
             for order in data['data']:
                 order_code = order['attributes'].get('code', 'Нет номера заказа')
                 pickup_point = order['attributes'].get('pickupPointId', 'Неизвестный магазин')
-                # Замена значения магазина из словаря, если ключ есть, иначе исходное значение
                 pickup_point = store_mapping.get(pickup_point, pickup_point)
                 courier_transmission_planning_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionPlanningDate')
                 courier_transmission_date = order['attributes'].get('kaspiDelivery', {}).get('courierTransmissionDate')
 
-                if courier_transmission_planning_date:
-                    planned_date = datetime.fromtimestamp(courier_transmission_planning_date / 1000, tz=UTC_PLUS_5)
-                    # Логирование для отладки
-                    logging.info(f"Заказ {order_code}, pickup_point: {pickup_point}, planned_date: {planned_date}")
-                    # Специальная логика для точки 14576033_9041 (Almaty Warehouse)
-                    if pickup_point == store_mapping.get("14576033_9041", "Almaty Warehouse"):
-                        # Заказы с planned_date в диапазоне от начала сегодня до конца +7 дня
-                        if start_of_day <= planned_date <= end_of_week and courier_transmission_date is None:
-                            if pickup_point not in pending_orders_by_store:
-                                pending_orders_by_store[pickup_point] = []
-                            pending_orders_by_store[pickup_point].append(order_code)
-                    else:
-                        # Обычная логика для остальных точек: заказы только на текущий день
+                # Для точки 9041 (Almaty Warehouse) берем все заказы без фильтра по дате планируемой передачи
+                if pickup_point == store_mapping.get("14576033_9041", "Almaty Warehouse"):
+                    if courier_transmission_date is None:
+                        if pickup_point not in pending_orders_by_store:
+                            pending_orders_by_store[pickup_point] = []
+                        pending_orders_by_store[pickup_point].append(order_code)
+                else:
+                    # Для остальных точек фильтруем по дате планируемой передачи на сегодня
+                    if courier_transmission_planning_date:
+                        planned_date = datetime.fromtimestamp(courier_transmission_planning_date / 1000, tz=UTC_PLUS_5)
                         if start_of_day <= planned_date <= end_of_day and courier_transmission_date is None:
                             if pickup_point not in pending_orders_by_store:
                                 pending_orders_by_store[pickup_point] = []
@@ -516,8 +509,8 @@ def send_pending_report(message):
 
         file_name = create_excel(pending_orders_by_store, sheet_name="Pending Orders")
         email_body = (
-            "Қайырлы таң, Төменде бүгін және алдағы 7 күнде курьерге жіберілуі керек тапсырыс саны (Almaty Warehouse үшін бүгіннен бастап +7 күн).\n\n"
-            "Good morning, Attached are all the pending orders for courier handover today and the next 7 days (from today up to +7 days for Almaty Warehouse)."
+            "Қайырлы таң, Төменде бүгін курьерге жіберілуі керек тапсырыс саны.\n\n"
+            "Good morning, Attached are all the pending orders for courier handover today."
         )
         send_email(file_name, subject="Pending orders OMS", email_body=email_body)
 
@@ -561,8 +554,8 @@ def job_pending():
 
         file_name = create_excel(pending_orders_by_store, sheet_name="Pending Orders")
         email_body = (
-            "Қайырлы таң, Төменде бүгін және алдағы 7 күнде курьерге жіберілуі керек тапсырыс саны (Almaty Warehouse үшін бүгіннен бастап +7 күн).\n\n"
-            "Good morning, Attached are all the pending orders for courier handover today and the next 7 days (from today up to +7 days for Almaty Warehouse)."
+            "Қайырлы таң, Төменде бүгін курьерге жіберілуі керек тапсырыс саны.\n\n"
+            "Good morning, Attached are all the pending orders for courier handover today."
         )
         send_email(file_name, subject="Pending orders OMS", email_body=email_body)
         logging.info("Автоотправка отчета по ожидающим заказам завершена.")
