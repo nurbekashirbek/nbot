@@ -170,6 +170,7 @@ def get_pending_orders():
             'filter[orders][state]': 'KASPI_DELIVERY'
         }
 
+        
         headers = {
             'X-Auth-Token': os.getenv('KASPI_AUTH_TOKEN'),
             'User-Agent': 'PostmanRuntime/7.32.0',
@@ -602,3 +603,4 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
+
