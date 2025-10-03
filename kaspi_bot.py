@@ -234,7 +234,7 @@ def get_pending_orders():
                                 pending_orders_by_store[pickup_point] = []
                             pending_orders_by_store[pickup_point].append(order_code)
 
-            if len(data['data']) < params['page[size]']:
+            if len(data['data']) < params['page[size]']: 
                 break
             else:
                 page_number += 1
@@ -603,5 +603,6 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
+
 
 
