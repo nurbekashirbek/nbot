@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 import telebot
 import schedule
-import time
+import time 
 import openpyxl
 import matplotlib
 matplotlib.use('Agg')
@@ -603,4 +603,5 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
+
 
