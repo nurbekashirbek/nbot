@@ -54,6 +54,7 @@ store_mapping = {
     "14576033_9004": "Shym Bayan Sulu",
     "14576033_9104": "Astana Reebok",
     "14576033_9006": "Astana Asia Park",
+    "14576033_9101": "Aktobe Reebok",
     "14576033_9041": "Almaty Warehouse",
     "Итого": "Total"
 }
@@ -603,6 +604,7 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
+
 
 
 
