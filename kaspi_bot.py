@@ -566,7 +566,7 @@ def job_pending():
         logging.error(f"Ошибка при автоотправке отчета по ожидающим заказам: {e}")
 
 # Планирование задач в UTC+5
-schedule.every().day.at("12:59").do(job_overdue)
+schedule.every().day.at("14:59").do(job_overdue)
 schedule.every().day.at("04:59").do(job_pending)
 
 def run_scheduler():
@@ -604,6 +604,7 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         logging.error(f"Ошибка в основном цикле: {e}")
+
 
 
 
