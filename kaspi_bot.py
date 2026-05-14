@@ -567,7 +567,7 @@ def job_pending():
 
 # Планирование задач в UTC+5
 schedule.every().day.at("14:59").do(job_overdue)
-schedule.every().day.at("04:59").do(job_pending)
+schedule.every().day.at("03:59").do(job_pending)
 
 def run_scheduler():
     while True:
