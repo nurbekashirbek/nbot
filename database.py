@@ -263,8 +263,22 @@ def bulk_insert_history_if_changed(orders, id_map):
         )
     """
 
+    # Explicit casts are important here. If a whole VALUES batch contains NULL
+    # for one of the timestamp columns, PostgreSQL can infer that VALUES column
+    # as text, which then breaks IS NOT DISTINCT FROM against timestamptz.
+    history_template = (
+        "(%s::bigint,%s::text,%s::boolean,%s::boolean,%s::boolean,"
+        "%s::timestamptz,%s::timestamptz)"
+    )
+
     with db_connection() as (_, cur):
-        execute_values(cur, sql, rows, page_size=500)
+        execute_values(
+            cur,
+            sql,
+            rows,
+            template=history_template,
+            page_size=500,
+        )
         return cur.rowcount
 
 
@@ -467,6 +481,45 @@ def get_open_delay_codes():
               AND is_cancelled = FALSE
             ORDER BY order_code
             """
+        )
+        return [str(r[0]) for r in cur.fetchall()]
+
+
+
+def get_operational_orders(cutoff_end):
+    """
+    Orders that still need courier handover and whose planned handover time
+    is before cutoff_end. Used for today's pending + open delays.
+    """
+    with db_connection(dict_cursor=True) as (_, cur):
+        cur.execute(
+            """
+            SELECT *
+            FROM orders
+            WHERE is_cancelled = FALSE
+              AND actual_transmission_date IS NULL
+              AND planned_transmission_date IS NOT NULL
+              AND planned_transmission_date < %s
+            ORDER BY planned_transmission_date, store_name, order_code
+            """,
+            (cutoff_end,),
+        )
+        return cur.fetchall()
+
+
+def get_operational_order_codes(cutoff_end):
+    with db_connection() as (_, cur):
+        cur.execute(
+            """
+            SELECT order_code
+            FROM orders
+            WHERE is_cancelled = FALSE
+              AND actual_transmission_date IS NULL
+              AND planned_transmission_date IS NOT NULL
+              AND planned_transmission_date < %s
+            ORDER BY planned_transmission_date, store_name, order_code
+            """,
+            (cutoff_end,),
         )
         return [str(r[0]) for r in cur.fetchall()]
 
