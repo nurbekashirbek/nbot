@@ -687,6 +687,182 @@ def get_store_period_otd(store_name, start_date, end_date):
         return cur.fetchall()
 
 
+
+
+def get_database_delete_all_preview():
+    """Preview all rows that will be removed by full cleanup."""
+    with db_connection(dict_cursor=True) as (_, cur):
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM daily_otd) AS daily_otd,
+                (SELECT COUNT(*) FROM daily_order_snapshot) AS daily_order_snapshot,
+                (SELECT COUNT(*) FROM order_status_history) AS order_status_history,
+                (SELECT COUNT(*) FROM orders) AS orders
+            """
+        )
+        return dict(cur.fetchone())
+
+
+def delete_all_bot_data():
+    """Delete every row from bot tables while keeping the table schema."""
+    preview = get_database_delete_all_preview()
+    with db_connection() as (_, cur):
+        cur.execute(
+            """
+            TRUNCATE TABLE
+                daily_otd,
+                daily_order_snapshot,
+                order_status_history,
+                orders
+            RESTART IDENTITY CASCADE
+            """
+        )
+    return {key: int(value or 0) for key, value in preview.items()}
+
+def get_database_cleanup_preview(start_date, end_date):
+    """
+    Preview rows that will be deleted for the inclusive period.
+
+    Historical report/status rows are counted directly by their dates.
+    Old order master rows are counted only when they:
+      - belong to the selected period,
+      - are not currently delayed,
+      - are completed/transmitted or cancelled,
+      - have no snapshot/history references outside the selected period.
+    """
+    with db_connection(dict_cursor=True) as (_, cur):
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*)
+                   FROM daily_otd
+                  WHERE report_date BETWEEN %s AND %s) AS daily_otd,
+
+                (SELECT COUNT(*)
+                   FROM daily_order_snapshot
+                  WHERE report_date BETWEEN %s AND %s) AS daily_order_snapshot,
+
+                (SELECT COUNT(*)
+                   FROM order_status_history
+                  WHERE recorded_at::date BETWEEN %s AND %s) AS order_status_history,
+
+                (
+                    SELECT COUNT(*)
+                      FROM orders o
+                     WHERE COALESCE(
+                               o.creation_date::date,
+                               o.first_seen_at::date,
+                               o.created_at::date
+                           ) BETWEEN %s AND %s
+                       AND COALESCE(o.is_currently_delayed, FALSE) = FALSE
+                       AND (
+                               o.actual_transmission_date IS NOT NULL
+                               OR COALESCE(o.is_cancelled, FALSE) = TRUE
+                           )
+                       AND NOT EXISTS (
+                               SELECT 1
+                                 FROM daily_order_snapshot s
+                                WHERE s.order_id = o.id
+                                  AND NOT (s.report_date BETWEEN %s AND %s)
+                           )
+                       AND NOT EXISTS (
+                               SELECT 1
+                                 FROM order_status_history h
+                                WHERE h.order_id = o.id
+                                  AND NOT (h.recorded_at::date BETWEEN %s AND %s)
+                           )
+                ) AS orders
+            """,
+            (
+                start_date, end_date,
+                start_date, end_date,
+                start_date, end_date,
+                start_date, end_date,
+                start_date, end_date,
+                start_date, end_date,
+            ),
+        )
+        return dict(cur.fetchone())
+
+
+def delete_data_for_period(start_date, end_date):
+    """
+    Delete historical data for the inclusive selected period.
+
+    Safety:
+    - current open delays are never deleted from orders;
+    - unfinished non-cancelled orders are never deleted from orders;
+    - order rows are deleted only if they have no history/snapshot outside
+      the selected period.
+    """
+    counts = {
+        "daily_otd": 0,
+        "daily_order_snapshot": 0,
+        "order_status_history": 0,
+        "orders": 0,
+    }
+
+    with db_connection() as (_, cur):
+        # First delete historical fact tables for the requested period.
+        cur.execute(
+            """
+            DELETE FROM daily_otd
+             WHERE report_date BETWEEN %s AND %s
+            """,
+            (start_date, end_date),
+        )
+        counts["daily_otd"] = cur.rowcount
+
+        cur.execute(
+            """
+            DELETE FROM daily_order_snapshot
+             WHERE report_date BETWEEN %s AND %s
+            """,
+            (start_date, end_date),
+        )
+        counts["daily_order_snapshot"] = cur.rowcount
+
+        cur.execute(
+            """
+            DELETE FROM order_status_history
+             WHERE recorded_at::date BETWEEN %s AND %s
+            """,
+            (start_date, end_date),
+        )
+        counts["order_status_history"] = cur.rowcount
+
+        # Then remove order master rows that became fully orphaned.
+        cur.execute(
+            """
+            DELETE FROM orders o
+             WHERE COALESCE(
+                       o.creation_date::date,
+                       o.first_seen_at::date,
+                       o.created_at::date
+                   ) BETWEEN %s AND %s
+               AND COALESCE(o.is_currently_delayed, FALSE) = FALSE
+               AND (
+                       o.actual_transmission_date IS NOT NULL
+                       OR COALESCE(o.is_cancelled, FALSE) = TRUE
+                   )
+               AND NOT EXISTS (
+                       SELECT 1
+                         FROM daily_order_snapshot s
+                        WHERE s.order_id = o.id
+                   )
+               AND NOT EXISTS (
+                       SELECT 1
+                         FROM order_status_history h
+                        WHERE h.order_id = o.id
+                   )
+            """,
+            (start_date, end_date),
+        )
+        counts["orders"] = cur.rowcount
+
+    return counts
+
 def get_period_snapshots(start_date, end_date):
     with db_connection(dict_cursor=True) as (_, cur):
         cur.execute(
