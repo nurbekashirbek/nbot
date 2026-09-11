@@ -7,7 +7,9 @@ import schedule
 import time
 import openpyxl
 import matplotlib
+
 matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import smtplib
@@ -23,20 +25,24 @@ from database import test_connection, get_table_counts
 
 
 # ============================================================
-# ЛОГИРОВАНИЕ
+# LOGGING
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
 
 
 # ============================================================
-# ПРОВЕРКА SUPABASE ПРИ ЗАПУСКЕ
+# DATABASE CONNECTION TEST ON STARTUP
 # ============================================================
 
-if test_connection():
+db_ok, db_message = test_connection()
+
+if db_ok:
     logging.info("✅ Supabase database connected successfully")
 else:
-    logging.error("❌ Supabase database connection failed")
+    logging.error(
+        f"❌ Supabase database connection failed: {db_message}"
+    )
 
 
 # ============================================================
@@ -52,15 +58,30 @@ bot = telebot.TeleBot(API_KEY)
 
 
 # ============================================================
-# TELEGRAM COMMANDS
+# TELEGRAM COMMAND MENU
 # ============================================================
 
 commands = [
-    BotCommand('orders', 'Получить список задержанных заказов'),
-    BotCommand('pending_orders', 'Получить список заказов, ожидающих передачи'),
-    BotCommand('send_report', 'Отправить отчет по задержанным заказам'),
-    BotCommand('send_pending_report', 'Отправить отчет по ожидающим заказам'),
-    BotCommand('db_test', 'Проверить подключение к базе данных')
+    BotCommand(
+        'orders',
+        'Получить список задержанных заказов'
+    ),
+    BotCommand(
+        'pending_orders',
+        'Получить список заказов, ожидающих передачи'
+    ),
+    BotCommand(
+        'send_report',
+        'Отправить отчет по задержанным заказам'
+    ),
+    BotCommand(
+        'send_pending_report',
+        'Отправить отчет по ожидающим заказам'
+    ),
+    BotCommand(
+        'db_test',
+        'Проверить подключение к базе данных'
+    )
 ]
 
 bot.set_my_commands(commands)
@@ -72,7 +93,9 @@ bot.set_my_commands(commands)
 
 API_URL = 'https://kaspi.kz/shop/api/v2/orders'
 
-UTC_PLUS_5 = timezone(timedelta(hours=5))
+UTC_PLUS_5 = timezone(
+    timedelta(hours=5)
+)
 
 
 # ============================================================
@@ -96,21 +119,28 @@ store_mapping = {
 
 
 # ============================================================
-# TELEGRAM LONG MESSAGE
+# SEND LONG TELEGRAM MESSAGE
 # ============================================================
 
 def send_long_message(chat_id, message):
+
     max_message_length = 4096
 
     while len(message) > max_message_length:
+
         bot.send_message(
             chat_id,
             message[:max_message_length]
         )
 
-        message = message[max_message_length:]
+        message = message[
+            max_message_length:
+        ]
 
-    bot.send_message(chat_id, message)
+    bot.send_message(
+        chat_id,
+        message
+    )
 
 
 # ============================================================
@@ -118,10 +148,40 @@ def send_long_message(chat_id, message):
 # ============================================================
 
 def get_date_range():
-    today = datetime.now(UTC_PLUS_5)
-    start_date = today - timedelta(days=14)
+
+    today = datetime.now(
+        UTC_PLUS_5
+    )
+
+    start_date = today - timedelta(
+        days=14
+    )
 
     return start_date, today
+
+
+# ============================================================
+# KASPI HEADERS
+# ============================================================
+
+def get_kaspi_headers():
+
+    kaspi_token = os.getenv(
+        'KASPI_AUTH_TOKEN'
+    )
+
+    if not kaspi_token:
+        raise ValueError(
+            "KASPI_AUTH_TOKEN is not set"
+        )
+
+    return {
+        'X-Auth-Token': kaspi_token,
+        'User-Agent': 'PostmanRuntime/7.32.0',
+        'Accept':
+            'application/vnd.api+json;charset=UTF-8',
+        'Connection': 'keep-alive'
+    }
 
 
 # ============================================================
@@ -129,9 +189,12 @@ def get_date_range():
 # ============================================================
 
 def get_overdue_orders():
+
     try:
 
-        start_date, today = get_date_range()
+        start_date, today = (
+            get_date_range()
+        )
 
         cutoff_time = today.replace(
             hour=23,
@@ -143,33 +206,27 @@ def get_overdue_orders():
         params = {
             'page[number]': 0,
             'page[size]': 100,
+
             'filter[orders][creationDate][$ge]':
-                int(start_date.timestamp() * 1000),
+                int(
+                    start_date.timestamp()
+                    * 1000
+                ),
+
             'filter[orders][creationDate][$le]':
-                int(today.timestamp() * 1000),
+                int(
+                    today.timestamp()
+                    * 1000
+                ),
+
             'filter[orders][status]':
                 'ACCEPTED_BY_MERCHANT',
+
             'filter[orders][state]':
                 'KASPI_DELIVERY'
         }
 
-        headers = {
-            'X-Auth-Token':
-                os.getenv('KASPI_AUTH_TOKEN'),
-
-            'User-Agent':
-                'PostmanRuntime/7.32.0',
-
-            'Accept':
-                'application/vnd.api+json;charset=UTF-8',
-
-            'Connection':
-                'keep-alive'
-        }
-
-        logging.info(
-            "Отправка запроса к API Kaspi..."
-        )
+        headers = get_kaspi_headers()
 
         overdue_orders_by_store = {}
 
@@ -177,10 +234,13 @@ def get_overdue_orders():
 
         while True:
 
-            params['page[number]'] = page_number
+            params[
+                'page[number]'
+            ] = page_number
 
             max_attempts = 2
             attempt = 1
+            response = None
 
             while attempt <= max_attempts:
 
@@ -194,7 +254,9 @@ def get_overdue_orders():
                     )
 
                     logging.info(
-                        f"Kaspi API response: {response.status_code}"
+                        "Kaspi overdue API "
+                        f"response: "
+                        f"{response.status_code}"
                     )
 
                     response.raise_for_status()
@@ -204,94 +266,133 @@ def get_overdue_orders():
                 except requests.exceptions.RequestException as e:
 
                     logging.error(
-                        f"Попытка {attempt}: "
-                        f"Ошибка Kaspi API: {e}"
+                        f"Overdue API attempt "
+                        f"{attempt}: {e}"
                     )
 
-                    if attempt == max_attempts:
+                    if (
+                        attempt
+                        == max_attempts
+                    ):
                         return None
 
                     attempt += 1
 
                     time.sleep(5)
 
+            if response is None:
+                return None
+
             data = response.json()
 
-            if (
-                'data' not in data
-                or not data['data']
-            ):
+            orders = data.get(
+                'data',
+                []
+            )
 
+            if not orders:
                 break
 
-            for order in data['data']:
+            for order in orders:
 
                 attributes = order.get(
                     'attributes',
                     {}
                 )
 
-                order_code = attributes.get(
-                    'code',
-                    'Нет номера заказа'
+                order_code = (
+                    attributes.get(
+                        'code',
+                        'Нет номера заказа'
+                    )
                 )
 
-                pickup_point = attributes.get(
-                    'pickupPointId',
-                    'Неизвестный магазин'
+                pickup_point_id = (
+                    attributes.get(
+                        'pickupPointId',
+                        'Неизвестный магазин'
+                    )
                 )
 
-                pickup_point = store_mapping.get(
-                    pickup_point,
-                    pickup_point
+                pickup_point = (
+                    store_mapping.get(
+                        pickup_point_id,
+                        pickup_point_id
+                    )
                 )
 
-                kaspi_delivery = attributes.get(
-                    'kaspiDelivery',
-                    {}
-                ) or {}
-
-                planned_timestamp = kaspi_delivery.get(
-                    'courierTransmissionPlanningDate'
+                kaspi_delivery = (
+                    attributes.get(
+                        'kaspiDelivery',
+                        {}
+                    )
+                    or {}
                 )
 
-                actual_timestamp = kaspi_delivery.get(
-                    'courierTransmissionDate'
+                planning_timestamp = (
+                    kaspi_delivery.get(
+                        'courierTransmissionPlanningDate'
+                    )
                 )
 
-                if planned_timestamp:
+                actual_timestamp = (
+                    kaspi_delivery.get(
+                        'courierTransmissionDate'
+                    )
+                )
 
-                    planned_date = datetime.fromtimestamp(
-                        planned_timestamp / 1000,
+                if not planning_timestamp:
+                    continue
+
+                planned_date = (
+                    datetime.fromtimestamp(
+                        planning_timestamp / 1000,
                         tz=UTC_PLUS_5
                     )
+                )
 
-                    if (
-                        planned_date < today
-                        or (
-                            planned_date.date()
-                            == today.date()
-                            and planned_date < cutoff_time
+                if (
+                    planned_date < today
+                    or (
+                        planned_date.date()
+                        == today.date()
+                        and planned_date
+                        < cutoff_time
+                    )
+                ):
+
+                    if actual_timestamp is None:
+
+                        if (
+                            pickup_point
+                            not in
+                            overdue_orders_by_store
+                        ):
+                            overdue_orders_by_store[
+                                pickup_point
+                            ] = []
+
+                        overdue_orders_by_store[
+                            pickup_point
+                        ].append(
+                            order_code
                         )
-                    ):
 
-                        if actual_timestamp is None:
-
-                            if pickup_point not in overdue_orders_by_store:
-                                overdue_orders_by_store[pickup_point] = []
-
-                            overdue_orders_by_store[pickup_point].append(
-                                order_code
-                            )
-
-            if len(data['data']) < params['page[size]']:
+            if len(orders) < params[
+                'page[size]'
+            ]:
                 break
 
             page_number += 1
 
+        total = sum(
+            len(v)
+            for v
+            in overdue_orders_by_store.values()
+        )
+
         logging.info(
-            f"Найдено просроченных заказов: "
-            f"{sum(len(v) for v in overdue_orders_by_store.values())}"
+            f"Overdue orders found: {total}"
         )
 
         return overdue_orders_by_store
@@ -299,7 +400,7 @@ def get_overdue_orders():
     except Exception as e:
 
         logging.error(
-            f"Ошибка при получении просроченных заказов: {e}"
+            f"get_overdue_orders error: {e}"
         )
 
         return None
@@ -310,9 +411,12 @@ def get_overdue_orders():
 # ============================================================
 
 def get_pending_orders():
+
     try:
 
-        start_date, today = get_date_range()
+        start_date, today = (
+            get_date_range()
+        )
 
         start_of_day = today.replace(
             hour=0,
@@ -331,29 +435,27 @@ def get_pending_orders():
         params = {
             'page[number]': 0,
             'page[size]': 100,
+
             'filter[orders][creationDate][$ge]':
-                int(start_date.timestamp() * 1000),
+                int(
+                    start_date.timestamp()
+                    * 1000
+                ),
+
             'filter[orders][creationDate][$le]':
-                int(today.timestamp() * 1000),
+                int(
+                    today.timestamp()
+                    * 1000
+                ),
+
             'filter[orders][status]':
                 'ACCEPTED_BY_MERCHANT',
+
             'filter[orders][state]':
                 'KASPI_DELIVERY'
         }
 
-        headers = {
-            'X-Auth-Token':
-                os.getenv('KASPI_AUTH_TOKEN'),
-
-            'User-Agent':
-                'PostmanRuntime/7.32.0',
-
-            'Accept':
-                'application/vnd.api+json;charset=UTF-8',
-
-            'Connection':
-                'keep-alive'
-        }
+        headers = get_kaspi_headers()
 
         pending_orders_by_store = {}
 
@@ -361,10 +463,13 @@ def get_pending_orders():
 
         while True:
 
-            params['page[number]'] = page_number
+            params[
+                'page[number]'
+            ] = page_number
 
             max_attempts = 2
             attempt = 1
+            response = None
 
             while attempt <= max_attempts:
 
@@ -377,6 +482,12 @@ def get_pending_orders():
                         timeout=30
                     )
 
+                    logging.info(
+                        "Kaspi pending API "
+                        f"response: "
+                        f"{response.status_code}"
+                    )
+
                     response.raise_for_status()
 
                     break
@@ -384,26 +495,34 @@ def get_pending_orders():
                 except requests.exceptions.RequestException as e:
 
                     logging.error(
-                        f"Kaspi API error attempt {attempt}: {e}"
+                        f"Pending API attempt "
+                        f"{attempt}: {e}"
                     )
 
-                    if attempt == max_attempts:
+                    if (
+                        attempt
+                        == max_attempts
+                    ):
                         return None
 
                     attempt += 1
 
                     time.sleep(5)
 
+            if response is None:
+                return None
+
             data = response.json()
 
-            if (
-                'data' not in data
-                or not data['data']
-            ):
+            orders = data.get(
+                'data',
+                []
+            )
 
+            if not orders:
                 break
 
-            for order in data['data']:
+            for order in orders:
 
                 attributes = order.get(
                     'attributes',
@@ -415,58 +534,89 @@ def get_pending_orders():
                     'Нет номера заказа'
                 )
 
-                pickup_point = attributes.get(
-                    'pickupPointId',
-                    'Неизвестный магазин'
+                pickup_point_id = (
+                    attributes.get(
+                        'pickupPointId',
+                        'Неизвестный магазин'
+                    )
                 )
 
-                pickup_point = store_mapping.get(
-                    pickup_point,
-                    pickup_point
+                pickup_point = (
+                    store_mapping.get(
+                        pickup_point_id,
+                        pickup_point_id
+                    )
                 )
 
-                kaspi_delivery = attributes.get(
-                    'kaspiDelivery',
-                    {}
-                ) or {}
-
-                planned_timestamp = kaspi_delivery.get(
-                    'courierTransmissionPlanningDate'
+                kaspi_delivery = (
+                    attributes.get(
+                        'kaspiDelivery',
+                        {}
+                    )
+                    or {}
                 )
 
-                actual_timestamp = kaspi_delivery.get(
-                    'courierTransmissionDate'
+                planning_timestamp = (
+                    kaspi_delivery.get(
+                        'courierTransmissionPlanningDate'
+                    )
                 )
 
-                if planned_timestamp:
+                actual_timestamp = (
+                    kaspi_delivery.get(
+                        'courierTransmissionDate'
+                    )
+                )
 
-                    planned_date = datetime.fromtimestamp(
-                        planned_timestamp / 1000,
+                if not planning_timestamp:
+                    continue
+
+                planned_date = (
+                    datetime.fromtimestamp(
+                        planning_timestamp / 1000,
                         tz=UTC_PLUS_5
                     )
+                )
+
+                if (
+                    start_of_day
+                    <= planned_date
+                    <= end_of_day
+                    and
+                    actual_timestamp is None
+                ):
 
                     if (
-                        start_of_day
-                        <= planned_date
-                        <= end_of_day
-                        and actual_timestamp is None
+                        pickup_point
+                        not in
+                        pending_orders_by_store
                     ):
 
-                        if pickup_point not in pending_orders_by_store:
-                            pending_orders_by_store[pickup_point] = []
+                        pending_orders_by_store[
+                            pickup_point
+                        ] = []
 
-                        pending_orders_by_store[pickup_point].append(
-                            order_code
-                        )
+                    pending_orders_by_store[
+                        pickup_point
+                    ].append(
+                        order_code
+                    )
 
-            if len(data['data']) < params['page[size]']:
+            if len(orders) < params[
+                'page[size]'
+            ]:
                 break
 
             page_number += 1
 
+        total = sum(
+            len(v)
+            for v
+            in pending_orders_by_store.values()
+        )
+
         logging.info(
-            f"Pending orders: "
-            f"{sum(len(v) for v in pending_orders_by_store.values())}"
+            f"Pending orders found: {total}"
         )
 
         return pending_orders_by_store
@@ -474,14 +624,14 @@ def get_pending_orders():
     except Exception as e:
 
         logging.error(
-            f"Ошибка pending orders: {e}"
+            f"get_pending_orders error: {e}"
         )
 
         return None
 
 
 # ============================================================
-# EXCEL CREATION
+# CREATE EXCEL
 # ============================================================
 
 def create_excel(
@@ -492,6 +642,7 @@ def create_excel(
     wb = openpyxl.Workbook()
 
     ws1 = wb.active
+
     ws1.title = sheet_name
 
     ws1.append([
@@ -499,7 +650,9 @@ def create_excel(
         "Order Number"
     ])
 
-    for store, orders in orders_by_store.items():
+    for store, orders in (
+        orders_by_store.items()
+    ):
 
         for order_code in orders:
 
@@ -519,32 +672,47 @@ def create_excel(
 
     total_orders = 0
 
-    for store, orders in orders_by_store.items():
+    for store, orders in (
+        orders_by_store.items()
+    ):
 
         ws2.append([
             store,
             len(orders)
         ])
 
-        total_orders += len(orders)
+        total_orders += len(
+            orders
+        )
 
     ws2.append([
         "Итого",
         total_orders
     ])
 
+    safe_sheet_name = (
+        sheet_name
+        .lower()
+        .replace(
+            ' ',
+            '_'
+        )
+    )
+
     file_name = (
-        f"{sheet_name.lower().replace(' ', '_')}_"
+        f"{safe_sheet_name}_"
         f"{datetime.now(UTC_PLUS_5).strftime('%Y%m%d_%H%M%S')}.xlsx"
     )
 
-    wb.save(file_name)
+    wb.save(
+        file_name
+    )
 
     return file_name
 
 
 # ============================================================
-# TABLE SCREENSHOT
+# SCREENSHOT
 # ============================================================
 
 def create_table_screenshot(
@@ -562,7 +730,9 @@ def create_table_screenshot(
         )
     )
 
-    ax.axis('off')
+    ax.axis(
+        'off'
+    )
 
     table = ax.table(
         cellText=df.values,
@@ -571,9 +741,18 @@ def create_table_screenshot(
         loc='center'
     )
 
-    table.auto_set_font_size(False)
-    table.set_fontsize(12)
-    table.scale(1, 1.5)
+    table.auto_set_font_size(
+        False
+    )
+
+    table.set_fontsize(
+        12
+    )
+
+    table.scale(
+        1,
+        1.5
+    )
 
     plt.tight_layout()
 
@@ -609,7 +788,7 @@ def create_statistics_screenshot(
 
 
 # ============================================================
-# EMAIL
+# SEND EMAIL
 # ============================================================
 
 def send_email(
@@ -631,6 +810,10 @@ def send_email(
                 'EMAIL_FROM'
             )
 
+            email_password = os.getenv(
+                'EMAIL_PASSWORD'
+            )
+
             to_email_raw = os.getenv(
                 'EMAIL_TO',
                 ''
@@ -641,15 +824,27 @@ def send_email(
                 ''
             )
 
+            if not from_email:
+                raise ValueError(
+                    "EMAIL_FROM is not set"
+                )
+
+            if not email_password:
+                raise ValueError(
+                    "EMAIL_PASSWORD is not set"
+                )
+
             to_email = [
                 email.strip()
-                for email in to_email_raw.split(',')
+                for email
+                in to_email_raw.split(',')
                 if email.strip()
             ]
 
             cc_emails = [
                 email.strip()
-                for email in cc_email_raw.split(',')
+                for email
+                in cc_email_raw.split(',')
                 if email.strip()
             ]
 
@@ -664,28 +859,40 @@ def send_email(
                 "rb"
             ) as img_file:
 
-                img_base64 = base64.b64encode(
-                    img_file.read()
-                ).decode('utf-8')
+                img_base64 = (
+                    base64.b64encode(
+                        img_file.read()
+                    ).decode(
+                        'utf-8'
+                    )
+                )
 
             msg = MIMEMultipart(
                 'alternative'
             )
 
-            msg['From'] = (
+            msg[
+                'From'
+            ] = (
                 f"Nurbek ASHIRBEK "
                 f"<{from_email}>"
             )
 
-            msg['To'] = ', '.join(
+            msg[
+                'To'
+            ] = ', '.join(
                 to_email
             )
 
-            msg['Cc'] = ', '.join(
+            msg[
+                'Cc'
+            ] = ', '.join(
                 cc_emails
             )
 
-            msg['Subject'] = subject
+            msg[
+                'Subject'
+            ] = subject
 
             html_body = f"""
             <html>
@@ -698,7 +905,10 @@ def send_email(
                     <img
                         src="data:image/png;base64,{img_base64}"
                         alt="Statistics Table"
-                        style="width:100%; max-width:500px;"
+                        style="
+                            width:100%;
+                            max-width:500px;
+                        "
                     />
 
                     <p style="margin-top:20px;">
@@ -706,6 +916,7 @@ def send_email(
                     </p>
 
                     <p>
+
                         <span
                             style="
                                 color:#FF5733;
@@ -740,15 +951,19 @@ def send_email(
                 'rb'
             ) as f:
 
-                attachment = MIMEApplication(
-                    f.read(),
-                    _subtype="xlsx"
+                attachment = (
+                    MIMEApplication(
+                        f.read(),
+                        _subtype="xlsx"
+                    )
                 )
 
                 attachment.add_header(
                     'Content-Disposition',
                     'attachment',
-                    filename=os.path.basename(file_name)
+                    filename=os.path.basename(
+                        file_name
+                    )
                 )
 
                 msg.attach(
@@ -764,9 +979,7 @@ def send_email(
 
             server.login(
                 from_email,
-                os.getenv(
-                    'EMAIL_PASSWORD'
-                )
+                email_password
             )
 
             all_recipients = (
@@ -788,28 +1001,31 @@ def send_email(
 
             return True
 
-        except (
-            smtplib.SMTPException,
-            ConnectionResetError,
-            Exception
-        ) as e:
+        except Exception as e:
 
             logging.error(
-                f"Email attempt {attempt}: {e}"
+                f"Email attempt "
+                f"{attempt}: {e}"
             )
 
-            if attempt == max_attempts:
+            if (
+                attempt
+                == max_attempts
+            ):
                 return False
 
             attempt += 1
 
-            time.sleep(10)
+            time.sleep(
+                10
+            )
 
         finally:
 
             if (
                 screenshot_filename
-                and os.path.exists(
+                and
+                os.path.exists(
                     screenshot_filename
                 )
             ):
@@ -823,12 +1039,14 @@ def send_email(
                 except Exception as e:
 
                     logging.error(
-                        f"Screenshot delete error: {e}"
+                        "Screenshot delete "
+                        f"error: {e}"
                     )
 
             if (
                 file_name
-                and os.path.exists(
+                and
+                os.path.exists(
                     file_name
                 )
             ):
@@ -842,31 +1060,44 @@ def send_email(
                 except Exception as e:
 
                     logging.error(
-                        f"Excel delete error: {e}"
+                        "Excel delete "
+                        f"error: {e}"
                     )
 
 
 # ============================================================
-# DATABASE TEST COMMAND
+# /DB_TEST
 # ============================================================
 
 @bot.message_handler(
-    commands=['db_test']
+    commands=[
+        'db_test'
+    ]
 )
-def db_test(message):
+def db_test(
+    message
+):
 
     try:
 
         bot.send_message(
             message.chat.id,
-            "🔄 Проверяю подключение к Supabase..."
+            "🔄 Проверяю подключение "
+            "к Supabase..."
         )
 
-        if not test_connection():
+        success, error_message = (
+            test_connection()
+        )
+
+        if not success:
 
             bot.send_message(
                 message.chat.id,
-                "❌ Не удалось подключиться к Supabase."
+                "❌ Не удалось подключиться "
+                "к Supabase.\n\n"
+                f"Причина: "
+                f"{error_message}"
             )
 
             return
@@ -877,20 +1108,27 @@ def db_test(message):
 
             bot.send_message(
                 message.chat.id,
-                "⚠️ Подключение работает, "
-                "но таблицы прочитать не удалось."
+                "⚠️ Подключение к Supabase "
+                "работает, но таблицы "
+                "прочитать не удалось."
             )
 
             return
 
         response = (
-            "✅ Supabase connected successfully!\n\n"
+            "✅ Supabase connected "
+            "successfully!\n\n"
             "📊 Database status:\n\n"
-            f"📦 Orders: {counts['orders']}\n"
+
+            f"📦 Orders: "
+            f"{counts['orders']}\n"
+
             f"📝 Order history: "
             f"{counts['order_status_history']}\n"
+
             f"☀️ Daily snapshots: "
             f"{counts['daily_order_snapshot']}\n"
+
             f"📈 Daily OTD: "
             f"{counts['daily_otd']}"
         )
@@ -903,12 +1141,13 @@ def db_test(message):
     except Exception as e:
 
         logging.error(
-            f"DB test error: {e}"
+            f"DB test command error: {e}"
         )
 
         bot.send_message(
             message.chat.id,
-            f"❌ Database test error:\n{e}"
+            "❌ Database test error.\n\n"
+            "Проверь Render Logs."
         )
 
 
@@ -917,15 +1156,20 @@ def db_test(message):
 # ============================================================
 
 @bot.message_handler(
-    commands=['orders']
+    commands=[
+        'orders'
+    ]
 )
-def fetch_orders(message):
+def fetch_orders(
+    message
+):
 
     try:
 
         bot.send_message(
             message.chat.id,
-            "🔄 Получение списка просроченных заказов..."
+            "🔄 Получение списка "
+            "просроченных заказов..."
         )
 
         overdue_orders_by_store = (
@@ -936,16 +1180,20 @@ def fetch_orders(message):
 
             bot.send_message(
                 message.chat.id,
-                "❌ Нет просроченных заказов."
+                "❌ Нет просроченных заказов "
+                "за указанный период."
             )
 
             return
 
         response_text_orders = (
-            "📦 Задержанные заказы по магазинам:\n\n"
+            "📦 Задержанные заказы "
+            "по магазинам:\n\n"
         )
 
-        for store, orders in overdue_orders_by_store.items():
+        for store, orders in (
+            overdue_orders_by_store.items()
+        ):
 
             response_text_orders += (
                 f"Магазин {store}:\n"
@@ -954,7 +1202,8 @@ def fetch_orders(message):
             for order_code in orders:
 
                 response_text_orders += (
-                    f"  🔸 Номер заказа: {order_code}\n"
+                    f"  🔸 Номер заказа: "
+                    f"{order_code}\n"
                 )
 
             response_text_orders += "\n"
@@ -965,12 +1214,15 @@ def fetch_orders(message):
         )
 
         response_text_count = (
-            "📊 Статистика по задержанным заказам:\n\n"
+            "📊 Статистика по "
+            "задержанным заказам:\n\n"
         )
 
         total_orders = 0
 
-        for store, orders in overdue_orders_by_store.items():
+        for store, orders in (
+            overdue_orders_by_store.items()
+        ):
 
             response_text_count += (
                 f"{store}: "
@@ -1039,7 +1291,7 @@ def fetch_orders(message):
     except Exception as e:
 
         logging.error(
-            f"Orders command error: {e}"
+            f"/orders error: {e}"
         )
 
         bot.send_message(
@@ -1053,7 +1305,9 @@ def fetch_orders(message):
 # ============================================================
 
 @bot.message_handler(
-    commands=['pending_orders']
+    commands=[
+        'pending_orders'
+    ]
 )
 def fetch_pending_orders(
     message
@@ -1075,16 +1329,20 @@ def fetch_pending_orders(
 
             bot.send_message(
                 message.chat.id,
-                "❌ Нет заказов, ожидающих передачи курьеру."
+                "❌ Нет заказов, "
+                "ожидающих передачи курьеру."
             )
 
             return
 
         response_text_orders = (
-            "📦 Заказы, ожидающие передачи курьеру:\n\n"
+            "📦 Заказы, ожидающие "
+            "передачи курьеру:\n\n"
         )
 
-        for store, orders in pending_orders_by_store.items():
+        for store, orders in (
+            pending_orders_by_store.items()
+        ):
 
             response_text_orders += (
                 f"Магазин {store}:\n"
@@ -1093,7 +1351,8 @@ def fetch_pending_orders(
             for order_code in orders:
 
                 response_text_orders += (
-                    f"  🔸 Номер заказа: {order_code}\n"
+                    f"  🔸 Номер заказа: "
+                    f"{order_code}\n"
                 )
 
             response_text_orders += "\n"
@@ -1104,12 +1363,15 @@ def fetch_pending_orders(
         )
 
         response_text_count = (
-            "📊 Статистика по ожидающим заказам:\n\n"
+            "📊 Статистика по "
+            "ожидающим заказам:\n\n"
         )
 
         total_orders = 0
 
-        for store, orders in pending_orders_by_store.items():
+        for store, orders in (
+            pending_orders_by_store.items()
+        ):
 
             response_text_count += (
                 f"{store}: "
@@ -1178,7 +1440,7 @@ def fetch_pending_orders(
     except Exception as e:
 
         logging.error(
-            f"Pending command error: {e}"
+            f"/pending_orders error: {e}"
         )
 
         bot.send_message(
@@ -1192,7 +1454,9 @@ def fetch_pending_orders(
 # ============================================================
 
 @bot.message_handler(
-    commands=['send_report']
+    commands=[
+        'send_report'
+    ]
 )
 def send_report(
     message
@@ -1226,8 +1490,9 @@ def send_report(
 
         email_body = (
             "Good evening, "
-            "There are delayed orders that were supposed "
-            "to be handed over to the courier today."
+            "There are delayed orders "
+            "that were supposed to be "
+            "handed over to the courier today."
             "<br><br>"
             "Қайырлы кеш, "
             "Төменде кешіккен тапсырыс саны."
@@ -1243,7 +1508,8 @@ def send_report(
 
             bot.send_message(
                 message.chat.id,
-                "✅ Отчет успешно отправлен."
+                "✅ Отчет успешно отправлен "
+                "по электронной почте."
             )
 
         else:
@@ -1256,7 +1522,7 @@ def send_report(
     except Exception as e:
 
         logging.error(
-            f"Manual overdue report error: {e}"
+            f"/send_report error: {e}"
         )
 
         bot.send_message(
@@ -1270,7 +1536,9 @@ def send_report(
 # ============================================================
 
 @bot.message_handler(
-    commands=['send_pending_report']
+    commands=[
+        'send_pending_report'
+    ]
 )
 def send_pending_report(
     message
@@ -1292,7 +1560,8 @@ def send_pending_report(
 
             bot.send_message(
                 message.chat.id,
-                "❌ Нет ожидающих заказов."
+                "❌ Нет заказов, "
+                "ожидающих передачи курьеру."
             )
 
             return
@@ -1304,8 +1573,8 @@ def send_pending_report(
 
         email_body = (
             "Қайырлы таң, "
-            "Төменде бүгін курьерге жіберілуі "
-            "керек тапсырыс саны."
+            "Төменде бүгін курьерге "
+            "жіберілуі керек тапсырыс саны."
             "<br><br>"
             "Good morning, "
             "Attached are all pending orders "
@@ -1322,7 +1591,8 @@ def send_pending_report(
 
             bot.send_message(
                 message.chat.id,
-                "✅ Отчет успешно отправлен."
+                "✅ Отчет успешно отправлен "
+                "по электронной почте."
             )
 
         else:
@@ -1335,7 +1605,7 @@ def send_pending_report(
     except Exception as e:
 
         logging.error(
-            f"Manual pending report error: {e}"
+            f"/send_pending_report error: {e}"
         )
 
         bot.send_message(
@@ -1345,7 +1615,7 @@ def send_pending_report(
 
 
 # ============================================================
-# AUTO REPORTS
+# AUTO OVERDUE REPORT
 # ============================================================
 
 def job_overdue():
@@ -1353,7 +1623,8 @@ def job_overdue():
     try:
 
         logging.info(
-            "Запуск автоотчета overdue..."
+            "Запуск автоотправки "
+            "отчета overdue..."
         )
 
         overdue_orders_by_store = (
@@ -1375,8 +1646,9 @@ def job_overdue():
 
         email_body = (
             "Good evening, "
-            "There are delayed orders that were supposed "
-            "to be handed over to the courier today."
+            "There are delayed orders "
+            "that were supposed to be "
+            "handed over to the courier today."
             "<br><br>"
             "Қайырлы кеш, "
             "Төменде кешіккен тапсырыс саны."
@@ -1395,12 +1667,17 @@ def job_overdue():
         )
 
 
+# ============================================================
+# AUTO PENDING REPORT
+# ============================================================
+
 def job_pending():
 
     try:
 
         logging.info(
-            "Запуск автоотчета pending..."
+            "Запуск автоотправки "
+            "pending отчета..."
         )
 
         pending_orders_by_store = (
@@ -1422,8 +1699,8 @@ def job_pending():
 
         email_body = (
             "Қайырлы таң, "
-            "Төменде бүгін курьерге жіберілуі "
-            "керек тапсырыс саны."
+            "Төменде бүгін курьерге "
+            "жіберілуі керек тапсырыс саны."
             "<br><br>"
             "Good morning, "
             "Attached are all pending orders "
@@ -1502,18 +1779,26 @@ app = Flask(
 
 @app.route(
     '/' + API_KEY,
-    methods=['POST']
+    methods=[
+        'POST'
+    ]
 )
 def webhook():
 
-    update = telebot.types.Update.de_json(
-        request.stream.read().decode(
-            'utf-8'
+    update = (
+        telebot.types.Update.de_json(
+            request.stream
+            .read()
+            .decode(
+                'utf-8'
+            )
         )
     )
 
     bot.process_new_updates(
-        [update]
+        [
+            update
+        ]
     )
 
     return 'ok', 200
@@ -1538,7 +1823,10 @@ if __name__ == '__main__':
         bot.remove_webhook()
 
         bot.set_webhook(
-            url=f"https://nbot-n94j.onrender.com/{API_KEY}"
+            url=(
+                f"https://nbot-n94j.onrender.com/"
+                f"{API_KEY}"
+            )
         )
 
         port = int(
