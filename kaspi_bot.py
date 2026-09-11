@@ -66,8 +66,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://nbot-n94j.onrender.com").rstrip(
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "oms-kz-telegram-webhook")
 PORT = int(os.getenv("PORT", "5000"))
 
-MORNING_REPORT_TIME = os.getenv("MORNING_REPORT_TIME", "09:00")
-EVENING_REPORT_TIME = os.getenv("EVENING_REPORT_TIME", "20:00")
+MORNING_REPORT_TIME = os.getenv("MORNING_REPORT_TIME", "15:50")
+EVENING_REPORT_TIME = os.getenv("EVENING_REPORT_TIME", "15:57")
 SYNC_LOOKBACK_DAYS = int(os.getenv("SYNC_LOOKBACK_DAYS", "30"))
 KASPI_PARALLEL_WORKERS = max(1, min(int(os.getenv("KASPI_PARALLEL_WORKERS", "12")), 20))
 BACKGROUND_SYNC_MINUTES = max(5, int(os.getenv("BACKGROUND_SYNC_MINUTES", "10")))
