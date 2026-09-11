@@ -69,8 +69,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://nbot-n94j.onrender.com").rstrip(
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "oms-kz-telegram-webhook")
 PORT = int(os.getenv("PORT", "5000"))
 
-MORNING_REPORT_TIME = os.getenv("MORNING_REPORT_TIME", "16:05")
-EVENING_REPORT_TIME = os.getenv("EVENING_REPORT_TIME", "16:10")
+MORNING_REPORT_TIME = os.getenv("MORNING_REPORT_TIME", "9:05")
+EVENING_REPORT_TIME = os.getenv("EVENING_REPORT_TIME", "20:05")
 SYNC_LOOKBACK_DAYS = int(os.getenv("SYNC_LOOKBACK_DAYS", "30"))
 KASPI_PARALLEL_WORKERS = max(1, min(int(os.getenv("KASPI_PARALLEL_WORKERS", "12")), 20))
 BACKGROUND_SYNC_MINUTES = max(5, int(os.getenv("BACKGROUND_SYNC_MINUTES", "10")))
@@ -1750,12 +1750,17 @@ def morning_email_html(report_date):
     return f"""
     <div style="font-family:Arial;color:#1f1f1f">
       <p>Hello colleagues,<br>Добрый день, коллеги!</p>
-      <p>Please find the OMS KZ morning pending report for <b>{fmt_date(report_date)}</b>.<br>
-      Ниже утренняя сводка OMS KZ на <b>{fmt_date(report_date)}</b>.</p>
+      <p>Below is the report for <b>{fmt_date(report_date)}</b>. This shows the number of new orders from the <b>"Planned Today"</b> column that need to be handed over today. Next to it is the <b>"Previous Open Delays"</b> column, listing orders delayed from previous days; these must be located and handed over to the courier.
+      <br>
+      Ниже указано отчет за <b>{fmt_date(report_date)}</b>. Это количество новых заказов из столбца <b>"Planned Today"</b>, которые необходимо передать сегодня. Рядом находится столбец <b>"Previous Open Delays"</b> со списком заказов, задержанных в предыдущие дни; их нужно найти и передать курьеру.
+      </p>
       {table}
       <p>Detailed order-level information is attached in Excel.<br>
       Детальная информация по заказам находится во вложенном Excel.</p>
-      <p>Best regards,<br>OMS KZ</p>
+      <p>
+        <span style="color: #FF5733; font-weight: bold; font-size: 22px;">Nurbek ASHIRBEK</span><br>
+        <span style="color: #000000;">E-commerce specialist</span>
+      </p>
     </div>
     """
 
@@ -1806,16 +1811,19 @@ def daily_email_html(report_date):
     return f"""
     <div style="font-family:Arial;color:#1f1f1f">
       <p>Hello colleagues,<br>Добрый день, коллеги!</p>
-      <p>Please find the OMS KZ Daily OTD report for <b>{fmt_date(report_date)}</b>.<br>
-      Ниже итоговый OTD отчёт OMS KZ за <b>{fmt_date(report_date)}</b>.</p>
+      <p>Please find the Kaspi Daily OTD report for <b>{fmt_date(report_date)}</b>.<br>
+      Ниже итоговый OTD отчёт Kaspi за <b>{fmt_date(report_date)}</b>.</p>
       {main_table}
       <br>
       {delay_table}
       <p><b>Orders</b> format: Morning Orders (Actual after cancellations).<br>
       Формат <b>Orders</b>: Утренние заказы (фактические после отмен).</p>
-      <p>Individual order numbers are not shown in the email body. Detailed data is in Excel.<br>
-      Номера заказов в теле письма не показываются. Детальная информация находится в Excel.</p>
-      <p>Best regards,<br>OMS KZ</p>
+      <p>Detailed data is in Excel.<br>
+      Детальная информация находится в Excel.</p>
+      <p>
+        <span style="color: #FF5733; font-weight: bold; font-size: 22px;">Nurbek ASHIRBEK</span><br>
+        <span style="color: #000000;">E-commerce specialist</span>
+      </p>
     </div>
     """
 
