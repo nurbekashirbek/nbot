@@ -1749,18 +1749,29 @@ def morning_email_html(report_date):
     table = html_table(["Store Code", "Store", "Planned Today", "Previous Open Delays"], rows)
     return f"""
     <div style="font-family:Arial;color:#1f1f1f">
-      <p>Hello colleagues,<br>Добрый день, коллеги!</p>
-      <p>Below is the report for <b>{fmt_date(report_date)}</b>. This shows the number of new orders from the <b>"Planned Today"</b> column that need to be handed over today. Next to it is the <b>"Previous Open Delays"</b> column, listing orders delayed from previous days; these must be located and handed over to the courier.
-      <br>
-      Ниже указано отчет за <b>{fmt_date(report_date)}</b>. Это количество новых заказов из столбца <b>"Planned Today"</b>, которые необходимо передать сегодня. Рядом находится столбец <b>"Previous Open Delays"</b> со списком заказов, задержанных в предыдущие дни; их нужно найти и передать курьеру.
-      </p>
-      {table}
-      <p>Detailed order-level information is attached in Excel.<br>
-      Детальная информация по заказам находится во вложенном Excel.</p>
-      <p>
-        <span style="color: #FF5733; font-weight: bold; font-size: 22px;">Nurbek ASHIRBEK</span><br>
-        <span style="color: #000000;">E-commerce specialist</span>
-      </p>
+<p>Hello colleagues / Добрый день, коллеги!</p>
+
+<p>
+    <b>Daily Order Handover Report — {fmt_date(report_date)}</b><br>
+    Ежедневный отчет по передаче заказов
+</p>
+
+{table}
+
+<p>
+    <b>Planned Today</b> — orders to hand over today / заказы к передаче сегодня.<br>
+    <b>Previous Open Delays</b> — overdue orders requiring handover / просроченные заказы к передаче.
+</p>
+
+<p>
+    📎 Detailed order information is available in the attached Excel file.<br>
+    Детальная информация по заказам — во вложенном Excel-файле.
+</p>
+
+<p>
+    <span style="color: #FF5733; font-weight: bold; font-size: 22px;">Nurbek ASHIRBEK</span><br>
+    <span style="color: #000000;">E-commerce specialist</span>
+</p>
     </div>
     """
 
@@ -1810,20 +1821,33 @@ def daily_email_html(report_date):
 
     return f"""
     <div style="font-family:Arial;color:#1f1f1f">
-      <p>Hello colleagues,<br>Добрый день, коллеги!</p>
-      <p>Please find the Kaspi Daily OTD report for <b>{fmt_date(report_date)}</b>.<br>
-      Ниже итоговый OTD отчёт Kaspi за <b>{fmt_date(report_date)}</b>.</p>
-      {main_table}
-      <br>
-      {delay_table}
-      <p><b>Orders</b> format: Morning Orders (Actual after cancellations).<br>
-      Формат <b>Orders</b>: Утренние заказы (фактические после отмен).</p>
-      <p>Detailed data is in Excel.<br>
-      Детальная информация находится в Excel.</p>
-      <p>
-        <span style="color: #FF5733; font-weight: bold; font-size: 22px;">Nurbek ASHIRBEK</span><br>
-        <span style="color: #000000;">E-commerce specialist</span>
-      </p>
+<p>Hello colleagues / Добрый день, коллеги!</p>
+
+<p>
+    <b>Kaspi Daily OTD Report — {fmt_date(report_date)}</b><br>
+    Ежедневный OTD-отчёт Kaspi
+</p>
+
+{main_table}
+
+<br>
+
+{delay_table}
+
+<p>
+    <b>Orders</b> — Morning Orders (Actual after cancellations) /
+    Утренние заказы (фактические после отмен).
+</p>
+
+<p>
+    📎 Detailed order information is available in the attached Excel file.<br>
+    Детальная информация по заказам — во вложенном Excel-файле.
+</p>
+
+<p>
+    <span style="color: #FF5733; font-weight: bold; font-size: 22px;">Nurbek ASHIRBEK</span><br>
+    <span style="color: #000000;">E-commerce specialist</span>
+</p>
     </div>
     """
 
