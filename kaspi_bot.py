@@ -24,6 +24,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 from database import (
     test_connection,
+    ensure_report_dispatch_table,
+    was_auto_report_sent,
+    mark_auto_report_sent,
     get_table_counts,
     bulk_save_orders,
     bulk_save_morning_snapshot,
@@ -66,8 +69,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://nbot-n94j.onrender.com").rstrip(
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "oms-kz-telegram-webhook")
 PORT = int(os.getenv("PORT", "5000"))
 
-MORNING_REPORT_TIME = os.getenv("MORNING_REPORT_TIME", "15:50")
-EVENING_REPORT_TIME = os.getenv("EVENING_REPORT_TIME", "15:57")
+MORNING_REPORT_TIME = os.getenv("MORNING_REPORT_TIME", "16:05")
+EVENING_REPORT_TIME = os.getenv("EVENING_REPORT_TIME", "16:10")
 SYNC_LOOKBACK_DAYS = int(os.getenv("SYNC_LOOKBACK_DAYS", "30"))
 KASPI_PARALLEL_WORKERS = max(1, min(int(os.getenv("KASPI_PARALLEL_WORKERS", "12")), 20))
 BACKGROUND_SYNC_MINUTES = max(5, int(os.getenv("BACKGROUND_SYNC_MINUTES", "10")))
@@ -1944,11 +1947,23 @@ def db_cleanup_menu():
         InlineKeyboardButton("Старше 60 дней", callback_data="dbclean:60"),
         InlineKeyboardButton("Старше 90 дней", callback_data="dbclean:90"),
         InlineKeyboardButton("Выбрать период", callback_data="dbclean:custom"),
-        InlineKeyboardButton("Удалить все данные", callback_data="dbclean:all"),
+        InlineKeyboardButton("Удалить ВСЕ данные", callback_data="dbclean:all"),
         InlineKeyboardButton("Назад", callback_data="menu"),
     )
     return kb
 
+
+
+def db_cleanup_all_confirm_menu():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton(
+            "Да, удалить ВСЕ данные",
+            callback_data="dbclean_all_confirm",
+        ),
+        InlineKeyboardButton("Отмена", callback_data="db_cleanup"),
+    )
+    return kb
 
 def db_cleanup_confirm_menu(start_date, end_date):
     kb = InlineKeyboardMarkup(row_width=2)
@@ -1957,15 +1972,6 @@ def db_cleanup_confirm_menu(start_date, end_date):
             "Подтвердить удаление",
             callback_data=f"dbclean_confirm:{start_date.isoformat()}:{end_date.isoformat()}",
         ),
-        InlineKeyboardButton("Отмена", callback_data="db_cleanup"),
-    )
-    return kb
-
-
-def db_cleanup_all_confirm_menu():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("Да, удалить ВСЕ данные", callback_data="dbclean_all_confirm"),
         InlineKeyboardButton("Отмена", callback_data="db_cleanup"),
     )
     return kb
@@ -2235,11 +2241,11 @@ def callbacks(call):
                 f"Daily OTD: {preview.get('daily_otd', 0)}\n"
                 f"Снимки заказов: {preview.get('daily_order_snapshot', 0)}\n"
                 f"История статусов: {preview.get('order_status_history', 0)}\n"
+            f"Лог автоотчетов: {preview.get('report_dispatch_log', 0)}\n"
                 f"Заказы: {preview.get('orders', 0)}\n\n"
                 f"Всего строк: {total_rows}\n\n"
                 "Будут удалены также текущие заказы и открытые просрочки. "
-                "Таблицы Supabase останутся. После следующей синхронизации "
-                "актуальные заказы снова загрузятся из Kaspi.",
+                "Таблицы Supabase останутся, удалятся только данные.",
                 db_cleanup_all_confirm_menu(),
             )
             return
@@ -2257,6 +2263,7 @@ def callbacks(call):
             f"Daily OTD: {preview.get('daily_otd', 0)}\n"
             f"Снимки заказов: {preview.get('daily_order_snapshot', 0)}\n"
             f"История статусов: {preview.get('order_status_history', 0)}\n"
+            f"Лог автоотчетов: {preview.get('report_dispatch_log', 0)}\n"
             f"Старые завершенные заказы: {preview.get('orders', 0)}\n\n"
             f"Всего строк: {total_rows}\n\n"
             "Открытые просрочки и незавершенные заказы не удаляются.",
@@ -2273,6 +2280,7 @@ def callbacks(call):
             f"Daily OTD: {counts.get('daily_otd', 0)}\n"
             f"Снимки заказов: {counts.get('daily_order_snapshot', 0)}\n"
             f"История статусов: {counts.get('order_status_history', 0)}\n"
+            f"Лог автоотчетов: {counts.get('report_dispatch_log', 0)}\n"
             f"Заказы: {counts.get('orders', 0)}\n\n"
             f"Удалено строк: {total_rows}\n\n"
             "Структура таблиц Supabase сохранена.",
@@ -2295,6 +2303,7 @@ def callbacks(call):
             f"Daily OTD: {counts.get('daily_otd', 0)}\n"
             f"Снимки заказов: {counts.get('daily_order_snapshot', 0)}\n"
             f"История статусов: {counts.get('order_status_history', 0)}\n"
+            f"Лог автоотчетов: {counts.get('report_dispatch_log', 0)}\n"
             f"Старые завершенные заказы: {counts.get('orders', 0)}\n\n"
             f"Удалено строк: {total_rows}",
             back_menu(),
@@ -2499,6 +2508,7 @@ def state_input(message):
                 f"Daily OTD: {preview.get('daily_otd', 0)}\n"
                 f"Снимки заказов: {preview.get('daily_order_snapshot', 0)}\n"
                 f"История статусов: {preview.get('order_status_history', 0)}\n"
+            f"Лог автоотчетов: {preview.get('report_dispatch_log', 0)}\n"
                 f"Старые завершенные заказы: {preview.get('orders', 0)}\n\n"
                 f"Всего строк: {total_rows}\n\n"
                 "Открытые просрочки и незавершенные заказы не удаляются.",
@@ -2572,33 +2582,62 @@ def background_sync_loop():
 # ============================================================
 
 def automatic_morning_job():
+    report_date = today_kz()
     if not _report_lock.acquire(blocking=False):
-        logging.warning("Morning job skipped because another report is running")
+        logging.warning("Morning job postponed because another report is running")
+        _scheduler_state["morning"] = None
         return
+
     try:
-        create_morning_snapshot(today_kz())
-        if email_is_configured():
-            send_morning_email(today_kz())
-        logging.info("Automatic morning job completed")
+        # Snapshot may already exist because the user opened Morning Report manually.
+        # That must NOT block the scheduled email.
+        create_morning_snapshot(report_date)
+
+        if not email_is_configured():
+            logging.warning("Automatic morning email skipped: email is not configured")
+            return
+
+        send_morning_email(report_date)
+        mark_auto_report_sent(report_date, "morning")
+        logging.info("Automatic morning email sent | %s", report_date)
+
     except Exception:
+        # Allow another attempt while the configured time window is still open.
+        _scheduler_state["morning"] = None
         logging.exception("Automatic morning job failed")
     finally:
         _report_lock.release()
 
 
 def automatic_evening_job():
+    report_date = today_kz()
     if not _report_lock.acquire(blocking=False):
-        logging.warning("Evening job skipped because another report is running")
+        logging.warning("Evening job postponed because another report is running")
+        _scheduler_state["evening"] = None
         return
+
     try:
-        if get_snapshot_count(today_kz()) == 0:
+        if get_snapshot_count(report_date) == 0:
             logging.warning("Evening OTD skipped: no morning snapshot")
+            # Keep retry enabled during the time window in case snapshot appears.
+            _scheduler_state["evening"] = None
             return
-        finalize_daily_otd(today_kz())
-        if email_is_configured():
-            send_daily_email(today_kz())
-        logging.info("Automatic evening job completed")
+
+        # Daily OTD may already exist because it was generated manually.
+        # Recalculation/storage must NOT block the scheduled email.
+        finalize_daily_otd(report_date)
+
+        if not email_is_configured():
+            logging.warning("Automatic evening email skipped: email is not configured")
+            return
+
+        send_daily_email(report_date)
+        mark_auto_report_sent(report_date, "evening")
+        logging.info("Automatic evening email sent | %s", report_date)
+
     except Exception:
+        # Allow another attempt while the configured time window is still open.
+        _scheduler_state["evening"] = None
         logging.exception("Automatic evening job failed")
     finally:
         _report_lock.release()
@@ -2617,44 +2656,41 @@ def scheduler_loop():
             current = now_kz()
             d = current.date()
 
-            # MORNING:
-            # - only inside the configured time window
-            # - only once in this process
-            # - do not recreate/resend after a restart if today's snapshot exists
+            # MORNING
+            # Manual creation of the morning snapshot does not count as an
+            # automatic email send. Only report_dispatch_log does.
             if scheduled_time_window_open(current, MORNING_REPORT_TIME):
                 if _scheduler_state["morning"] != d:
-                    if get_snapshot_count(d) == 0:
+                    if was_auto_report_sent(d, "morning"):
+                        _scheduler_state["morning"] = d
+                        logging.info(
+                            "Automatic morning skipped | automatic email already sent for %s",
+                            d,
+                        )
+                    else:
                         _scheduler_state["morning"] = d
                         threading.Thread(
                             target=automatic_morning_job,
                             daemon=True,
                         ).start()
-                    else:
-                        _scheduler_state["morning"] = d
-                        logging.info(
-                            "Automatic morning skipped | snapshot already exists for %s",
-                            d,
-                        )
 
-            # EVENING:
-            # - only inside the configured time window
-            # - only once in this process
-            # - do not resend after a restart if Daily OTD is already stored
+            # EVENING
+            # Manual Daily OTD generation does not count as an automatic
+            # email send. Only report_dispatch_log does.
             if scheduled_time_window_open(current, EVENING_REPORT_TIME):
                 if _scheduler_state["evening"] != d:
-                    existing_daily = get_daily_otd(d)
-                    if not existing_daily:
+                    if was_auto_report_sent(d, "evening"):
+                        _scheduler_state["evening"] = d
+                        logging.info(
+                            "Automatic evening skipped | automatic email already sent for %s",
+                            d,
+                        )
+                    else:
                         _scheduler_state["evening"] = d
                         threading.Thread(
                             target=automatic_evening_job,
                             daemon=True,
                         ).start()
-                    else:
-                        _scheduler_state["evening"] = d
-                        logging.info(
-                            "Automatic evening skipped | Daily OTD already exists for %s",
-                            d,
-                        )
 
             time.sleep(30)
 
@@ -2691,6 +2727,11 @@ if __name__ == "__main__":
     ok, info = test_connection()
     if ok:
         logging.info("Supabase connected")
+        try:
+            ensure_report_dispatch_table()
+            logging.info("Report dispatch log is ready")
+        except Exception:
+            logging.exception("Failed to initialize report dispatch log")
     else:
         logging.error("Supabase connection failed: %s", info)
 
