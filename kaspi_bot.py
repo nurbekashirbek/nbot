@@ -1,1771 +1,77 @@
 import os
-import requests
-import logging
-from datetime import datetime, timedelta, timezone
-import telebot
-import schedule
 import time
-import openpyxl
-import matplotlib
-
-matplotlib.use('Agg')
-
-import matplotlib.pyplot as plt
-import pandas as pd
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
-import base64
+import logging
 import threading
-from telebot.types import BotCommand
-from flask import Flask, request
+from datetime import datetime, timedelta, timezone
 
-from database import test_connection, get_table_counts
+import requests
+import telebot
+from flask import Flask, request
+from telebot.types import BotCommand
+
+from database import (
+    test_connection,
+    get_table_counts,
+    upsert_order,
+    get_order_by_code,
+    save_status_history,
+    mark_order_morning_snapshot,
+    save_daily_snapshot,
+    get_snapshot_orders,
+    get_open_delays,
+    save_daily_otd,
+    get_daily_otd,
+    get_otd_history
+)
 
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
-
-
-# ============================================================
-# DATABASE CONNECTION TEST ON STARTUP
-# ============================================================
-
-db_ok, db_message = test_connection()
-
-if db_ok:
-    logging.info("✅ Supabase database connected successfully")
-else:
-    logging.error(
-        f"❌ Supabase database connection failed: {db_message}"
-    )
-
-
-# ============================================================
-# TELEGRAM BOT
-# ============================================================
-
-API_KEY = os.getenv('TELEGRAM_API_KEY')
-
-if not API_KEY:
-    raise ValueError("TELEGRAM_API_KEY is not set")
-
-bot = telebot.TeleBot(API_KEY)
-
-
-# ============================================================
-# TELEGRAM COMMAND MENU
-# ============================================================
-
-commands = [
-    BotCommand(
-        'orders',
-        'Получить список задержанных заказов'
-    ),
-    BotCommand(
-        'pending_orders',
-        'Получить список заказов, ожидающих передачи'
-    ),
-    BotCommand(
-        'send_report',
-        'Отправить отчет по задержанным заказам'
-    ),
-    BotCommand(
-        'send_pending_report',
-        'Отправить отчет по ожидающим заказам'
-    ),
-    BotCommand(
-        'db_test',
-        'Проверить подключение к базе данных'
-    )
-]
-
-bot.set_my_commands(commands)
-
-
-# ============================================================
-# KASPI API
-# ============================================================
-
-API_URL = 'https://kaspi.kz/shop/api/v2/orders'
-
-UTC_PLUS_5 = timezone(
-    timedelta(hours=5)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 
 # ============================================================
-# STORE MAPPING
+# ENVIRONMENT VARIABLES
 # ============================================================
 
-store_mapping = {
-    "14576033_9005": "Karaganda Tair",
-    "14576033_9020": "Almaty Mart",
-    "14576033_9003": "Almaty Aport",
-    "14576033_9080": "Astana InStreet",
-    "14576033_9078": "Aktobe InStreet",
-    "14576033_9077": "Almaty InStreet",
-    "14576033_9004": "Shym Bayan Sulu",
-    "14576033_9104": "Astana Reebok",
-    "14576033_9006": "Astana Asia Park",
-    "14576033_9101": "Aktobe Reebok",
-    "14576033_9041": "Almaty Warehouse",
-    "Итого": "Total"
-}
-
-
-# ============================================================
-# SEND LONG TELEGRAM MESSAGE
-# ============================================================
-
-def send_long_message(chat_id, message):
-
-    max_message_length = 4096
-
-    while len(message) > max_message_length:
-
-        bot.send_message(
-            chat_id,
-            message[:max_message_length]
-        )
-
-        message = message[
-            max_message_length:
-        ]
-
-    bot.send_message(
-        chat_id,
-        message
-    )
-
-
-# ============================================================
-# DATE RANGE
-# ============================================================
-
-def get_date_range():
-
-    today = datetime.now(
-        UTC_PLUS_5
-    )
-
-    start_date = today - timedelta(
-        days=14
-    )
-
-    return start_date, today
-
-
-# ============================================================
-# KASPI HEADERS
-# ============================================================
-
-def get_kaspi_headers():
-
-    kaspi_token = os.getenv(
-        'KASPI_AUTH_TOKEN'
-    )
-
-    if not kaspi_token:
-        raise ValueError(
-            "KASPI_AUTH_TOKEN is not set"
-        )
-
-    return {
-        'X-Auth-Token': kaspi_token,
-        'User-Agent': 'PostmanRuntime/7.32.0',
-        'Accept':
-            'application/vnd.api+json;charset=UTF-8',
-        'Connection': 'keep-alive'
-    }
-
-
-# ============================================================
-# OVERDUE ORDERS
-# ============================================================
-
-def get_overdue_orders():
-
-    try:
-
-        start_date, today = (
-            get_date_range()
-        )
-
-        cutoff_time = today.replace(
-            hour=23,
-            minute=0,
-            second=0,
-            microsecond=0
-        )
-
-        params = {
-            'page[number]': 0,
-            'page[size]': 100,
-
-            'filter[orders][creationDate][$ge]':
-                int(
-                    start_date.timestamp()
-                    * 1000
-                ),
-
-            'filter[orders][creationDate][$le]':
-                int(
-                    today.timestamp()
-                    * 1000
-                ),
-
-            'filter[orders][status]':
-                'ACCEPTED_BY_MERCHANT',
-
-            'filter[orders][state]':
-                'KASPI_DELIVERY'
-        }
-
-        headers = get_kaspi_headers()
-
-        overdue_orders_by_store = {}
-
-        page_number = 0
-
-        while True:
-
-            params[
-                'page[number]'
-            ] = page_number
-
-            max_attempts = 2
-            attempt = 1
-            response = None
-
-            while attempt <= max_attempts:
-
-                try:
-
-                    response = requests.get(
-                        API_URL,
-                        params=params,
-                        headers=headers,
-                        timeout=30
-                    )
-
-                    logging.info(
-                        "Kaspi overdue API "
-                        f"response: "
-                        f"{response.status_code}"
-                    )
-
-                    response.raise_for_status()
-
-                    break
-
-                except requests.exceptions.RequestException as e:
-
-                    logging.error(
-                        f"Overdue API attempt "
-                        f"{attempt}: {e}"
-                    )
-
-                    if (
-                        attempt
-                        == max_attempts
-                    ):
-                        return None
-
-                    attempt += 1
-
-                    time.sleep(5)
-
-            if response is None:
-                return None
-
-            data = response.json()
-
-            orders = data.get(
-                'data',
-                []
-            )
-
-            if not orders:
-                break
-
-            for order in orders:
-
-                attributes = order.get(
-                    'attributes',
-                    {}
-                )
-
-                order_code = (
-                    attributes.get(
-                        'code',
-                        'Нет номера заказа'
-                    )
-                )
-
-                pickup_point_id = (
-                    attributes.get(
-                        'pickupPointId',
-                        'Неизвестный магазин'
-                    )
-                )
-
-                pickup_point = (
-                    store_mapping.get(
-                        pickup_point_id,
-                        pickup_point_id
-                    )
-                )
-
-                kaspi_delivery = (
-                    attributes.get(
-                        'kaspiDelivery',
-                        {}
-                    )
-                    or {}
-                )
-
-                planning_timestamp = (
-                    kaspi_delivery.get(
-                        'courierTransmissionPlanningDate'
-                    )
-                )
-
-                actual_timestamp = (
-                    kaspi_delivery.get(
-                        'courierTransmissionDate'
-                    )
-                )
-
-                if not planning_timestamp:
-                    continue
-
-                planned_date = (
-                    datetime.fromtimestamp(
-                        planning_timestamp / 1000,
-                        tz=UTC_PLUS_5
-                    )
-                )
-
-                if (
-                    planned_date < today
-                    or (
-                        planned_date.date()
-                        == today.date()
-                        and planned_date
-                        < cutoff_time
-                    )
-                ):
-
-                    if actual_timestamp is None:
-
-                        if (
-                            pickup_point
-                            not in
-                            overdue_orders_by_store
-                        ):
-                            overdue_orders_by_store[
-                                pickup_point
-                            ] = []
-
-                        overdue_orders_by_store[
-                            pickup_point
-                        ].append(
-                            order_code
-                        )
-
-            if len(orders) < params[
-                'page[size]'
-            ]:
-                break
-
-            page_number += 1
-
-        total = sum(
-            len(v)
-            for v
-            in overdue_orders_by_store.values()
-        )
-
-        logging.info(
-            f"Overdue orders found: {total}"
-        )
-
-        return overdue_orders_by_store
-
-    except Exception as e:
-
-        logging.error(
-            f"get_overdue_orders error: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# PENDING ORDERS
-# ============================================================
-
-def get_pending_orders():
-
-    try:
-
-        start_date, today = (
-            get_date_range()
-        )
-
-        start_of_day = today.replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0
-        )
-
-        end_of_day = today.replace(
-            hour=23,
-            minute=59,
-            second=59,
-            microsecond=999999
-        )
-
-        params = {
-            'page[number]': 0,
-            'page[size]': 100,
-
-            'filter[orders][creationDate][$ge]':
-                int(
-                    start_date.timestamp()
-                    * 1000
-                ),
-
-            'filter[orders][creationDate][$le]':
-                int(
-                    today.timestamp()
-                    * 1000
-                ),
-
-            'filter[orders][status]':
-                'ACCEPTED_BY_MERCHANT',
-
-            'filter[orders][state]':
-                'KASPI_DELIVERY'
-        }
-
-        headers = get_kaspi_headers()
-
-        pending_orders_by_store = {}
-
-        page_number = 0
-
-        while True:
-
-            params[
-                'page[number]'
-            ] = page_number
-
-            max_attempts = 2
-            attempt = 1
-            response = None
-
-            while attempt <= max_attempts:
-
-                try:
-
-                    response = requests.get(
-                        API_URL,
-                        params=params,
-                        headers=headers,
-                        timeout=30
-                    )
-
-                    logging.info(
-                        "Kaspi pending API "
-                        f"response: "
-                        f"{response.status_code}"
-                    )
-
-                    response.raise_for_status()
-
-                    break
-
-                except requests.exceptions.RequestException as e:
-
-                    logging.error(
-                        f"Pending API attempt "
-                        f"{attempt}: {e}"
-                    )
-
-                    if (
-                        attempt
-                        == max_attempts
-                    ):
-                        return None
-
-                    attempt += 1
-
-                    time.sleep(5)
-
-            if response is None:
-                return None
-
-            data = response.json()
-
-            orders = data.get(
-                'data',
-                []
-            )
-
-            if not orders:
-                break
-
-            for order in orders:
-
-                attributes = order.get(
-                    'attributes',
-                    {}
-                )
-
-                order_code = attributes.get(
-                    'code',
-                    'Нет номера заказа'
-                )
-
-                pickup_point_id = (
-                    attributes.get(
-                        'pickupPointId',
-                        'Неизвестный магазин'
-                    )
-                )
-
-                pickup_point = (
-                    store_mapping.get(
-                        pickup_point_id,
-                        pickup_point_id
-                    )
-                )
-
-                kaspi_delivery = (
-                    attributes.get(
-                        'kaspiDelivery',
-                        {}
-                    )
-                    or {}
-                )
-
-                planning_timestamp = (
-                    kaspi_delivery.get(
-                        'courierTransmissionPlanningDate'
-                    )
-                )
-
-                actual_timestamp = (
-                    kaspi_delivery.get(
-                        'courierTransmissionDate'
-                    )
-                )
-
-                if not planning_timestamp:
-                    continue
-
-                planned_date = (
-                    datetime.fromtimestamp(
-                        planning_timestamp / 1000,
-                        tz=UTC_PLUS_5
-                    )
-                )
-
-                if (
-                    start_of_day
-                    <= planned_date
-                    <= end_of_day
-                    and
-                    actual_timestamp is None
-                ):
-
-                    if (
-                        pickup_point
-                        not in
-                        pending_orders_by_store
-                    ):
-
-                        pending_orders_by_store[
-                            pickup_point
-                        ] = []
-
-                    pending_orders_by_store[
-                        pickup_point
-                    ].append(
-                        order_code
-                    )
-
-            if len(orders) < params[
-                'page[size]'
-            ]:
-                break
-
-            page_number += 1
-
-        total = sum(
-            len(v)
-            for v
-            in pending_orders_by_store.values()
-        )
-
-        logging.info(
-            f"Pending orders found: {total}"
-        )
-
-        return pending_orders_by_store
-
-    except Exception as e:
-
-        logging.error(
-            f"get_pending_orders error: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# CREATE EXCEL
-# ============================================================
-
-def create_excel(
-    orders_by_store,
-    sheet_name="Orders"
-):
-
-    wb = openpyxl.Workbook()
-
-    ws1 = wb.active
-
-    ws1.title = sheet_name
-
-    ws1.append([
-        "Store",
-        "Order Number"
-    ])
-
-    for store, orders in (
-        orders_by_store.items()
-    ):
-
-        for order_code in orders:
-
-            ws1.append([
-                store,
-                order_code
-            ])
-
-    ws2 = wb.create_sheet(
-        "Statistics"
-    )
-
-    ws2.append([
-        "Store",
-        "Number of Orders"
-    ])
-
-    total_orders = 0
-
-    for store, orders in (
-        orders_by_store.items()
-    ):
-
-        ws2.append([
-            store,
-            len(orders)
-        ])
-
-        total_orders += len(
-            orders
-        )
-
-    ws2.append([
-        "Итого",
-        total_orders
-    ])
-
-    safe_sheet_name = (
-        sheet_name
-        .lower()
-        .replace(
-            ' ',
-            '_'
-        )
-    )
-
-    file_name = (
-        f"{safe_sheet_name}_"
-        f"{datetime.now(UTC_PLUS_5).strftime('%Y%m%d_%H%M%S')}.xlsx"
-    )
-
-    wb.save(
-        file_name
-    )
-
-    return file_name
-
-
-# ============================================================
-# SCREENSHOT
-# ============================================================
-
-def create_table_screenshot(
-    df,
-    filename
-):
-
-    fig, ax = plt.subplots(
-        figsize=(
-            7,
-            max(
-                2,
-                len(df) * 0.4
-            )
-        )
-    )
-
-    ax.axis(
-        'off'
-    )
-
-    table = ax.table(
-        cellText=df.values,
-        colLabels=df.columns,
-        cellLoc='center',
-        loc='center'
-    )
-
-    table.auto_set_font_size(
-        False
-    )
-
-    table.set_fontsize(
-        12
-    )
-
-    table.scale(
-        1,
-        1.5
-    )
-
-    plt.tight_layout()
-
-    plt.savefig(
-        filename,
-        bbox_inches='tight',
-        pad_inches=0.1
-    )
-
-    plt.close()
-
-
-def create_statistics_screenshot(
-    file_name
-):
-
-    df = pd.read_excel(
-        file_name,
-        sheet_name="Statistics"
-    )
-
-    screenshot_filename = (
-        "statistics_screenshot_"
-        f"{datetime.now(UTC_PLUS_5).strftime('%Y%m%d_%H%M%S')}.png"
-    )
-
-    create_table_screenshot(
-        df,
-        screenshot_filename
-    )
-
-    return screenshot_filename
-
-
-# ============================================================
-# SEND EMAIL
-# ============================================================
-
-def send_email(
-    file_name,
-    subject,
-    email_body
-):
-
-    max_attempts = 2
-    attempt = 1
-
-    screenshot_filename = None
-
-    while attempt <= max_attempts:
-
-        try:
-
-            from_email = os.getenv(
-                'EMAIL_FROM'
-            )
-
-            email_password = os.getenv(
-                'EMAIL_PASSWORD'
-            )
-
-            to_email_raw = os.getenv(
-                'EMAIL_TO',
-                ''
-            )
-
-            cc_email_raw = os.getenv(
-                'EMAIL_CC',
-                ''
-            )
-
-            if not from_email:
-                raise ValueError(
-                    "EMAIL_FROM is not set"
-                )
-
-            if not email_password:
-                raise ValueError(
-                    "EMAIL_PASSWORD is not set"
-                )
-
-            to_email = [
-                email.strip()
-                for email
-                in to_email_raw.split(',')
-                if email.strip()
-            ]
-
-            cc_emails = [
-                email.strip()
-                for email
-                in cc_email_raw.split(',')
-                if email.strip()
-            ]
-
-            screenshot_filename = (
-                create_statistics_screenshot(
-                    file_name
-                )
-            )
-
-            with open(
-                screenshot_filename,
-                "rb"
-            ) as img_file:
-
-                img_base64 = (
-                    base64.b64encode(
-                        img_file.read()
-                    ).decode(
-                        'utf-8'
-                    )
-                )
-
-            msg = MIMEMultipart(
-                'alternative'
-            )
-
-            msg[
-                'From'
-            ] = (
-                f"Nurbek ASHIRBEK "
-                f"<{from_email}>"
-            )
-
-            msg[
-                'To'
-            ] = ', '.join(
-                to_email
-            )
-
-            msg[
-                'Cc'
-            ] = ', '.join(
-                cc_emails
-            )
-
-            msg[
-                'Subject'
-            ] = subject
-
-            html_body = f"""
-            <html>
-                <body>
-
-                    <p>
-                        {email_body}
-                    </p>
-
-                    <img
-                        src="data:image/png;base64,{img_base64}"
-                        alt="Statistics Table"
-                        style="
-                            width:100%;
-                            max-width:500px;
-                        "
-                    />
-
-                    <p style="margin-top:20px;">
-                        С уважением,
-                    </p>
-
-                    <p>
-
-                        <span
-                            style="
-                                color:#FF5733;
-                                font-weight:bold;
-                                font-size:22px;
-                            "
-                        >
-                            Nurbek ASHIRBEK
-                        </span>
-
-                        <br>
-
-                        <span>
-                            E-commerce specialist
-                        </span>
-
-                    </p>
-
-                </body>
-            </html>
-            """
-
-            msg.attach(
-                MIMEText(
-                    html_body,
-                    'html'
-                )
-            )
-
-            with open(
-                file_name,
-                'rb'
-            ) as f:
-
-                attachment = (
-                    MIMEApplication(
-                        f.read(),
-                        _subtype="xlsx"
-                    )
-                )
-
-                attachment.add_header(
-                    'Content-Disposition',
-                    'attachment',
-                    filename=os.path.basename(
-                        file_name
-                    )
-                )
-
-                msg.attach(
-                    attachment
-                )
-
-            server = smtplib.SMTP(
-                'smtp.yandex.com',
-                587
-            )
-
-            server.starttls()
-
-            server.login(
-                from_email,
-                email_password
-            )
-
-            all_recipients = (
-                to_email
-                + cc_emails
-            )
-
-            server.sendmail(
-                from_email,
-                all_recipients,
-                msg.as_string()
-            )
-
-            server.quit()
-
-            logging.info(
-                "Email sent successfully"
-            )
-
-            return True
-
-        except Exception as e:
-
-            logging.error(
-                f"Email attempt "
-                f"{attempt}: {e}"
-            )
-
-            if (
-                attempt
-                == max_attempts
-            ):
-                return False
-
-            attempt += 1
-
-            time.sleep(
-                10
-            )
-
-        finally:
-
-            if (
-                screenshot_filename
-                and
-                os.path.exists(
-                    screenshot_filename
-                )
-            ):
-
-                try:
-
-                    os.remove(
-                        screenshot_filename
-                    )
-
-                except Exception as e:
-
-                    logging.error(
-                        "Screenshot delete "
-                        f"error: {e}"
-                    )
-
-            if (
-                file_name
-                and
-                os.path.exists(
-                    file_name
-                )
-            ):
-
-                try:
-
-                    os.remove(
-                        file_name
-                    )
-
-                except Exception as e:
-
-                    logging.error(
-                        "Excel delete "
-                        f"error: {e}"
-                    )
-
-
-# ============================================================
-# /DB_TEST
-# ============================================================
-
-@bot.message_handler(
-    commands=[
-        'db_test'
-    ]
-)
-def db_test(
-    message
-):
-
-    try:
-
-        bot.send_message(
-            message.chat.id,
-            "🔄 Проверяю подключение "
-            "к Supabase..."
-        )
-
-        success, error_message = (
-            test_connection()
-        )
-
-        if not success:
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Не удалось подключиться "
-                "к Supabase.\n\n"
-                f"Причина: "
-                f"{error_message}"
-            )
-
-            return
-
-        counts = get_table_counts()
-
-        if counts is None:
-
-            bot.send_message(
-                message.chat.id,
-                "⚠️ Подключение к Supabase "
-                "работает, но таблицы "
-                "прочитать не удалось."
-            )
-
-            return
-
-        response = (
-            "✅ Supabase connected "
-            "successfully!\n\n"
-            "📊 Database status:\n\n"
-
-            f"📦 Orders: "
-            f"{counts['orders']}\n"
-
-            f"📝 Order history: "
-            f"{counts['order_status_history']}\n"
-
-            f"☀️ Daily snapshots: "
-            f"{counts['daily_order_snapshot']}\n"
-
-            f"📈 Daily OTD: "
-            f"{counts['daily_otd']}"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            response
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"DB test command error: {e}"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            "❌ Database test error.\n\n"
-            "Проверь Render Logs."
-        )
-
-
-# ============================================================
-# /ORDERS
-# ============================================================
-
-@bot.message_handler(
-    commands=[
-        'orders'
-    ]
-)
-def fetch_orders(
-    message
-):
-
-    try:
-
-        bot.send_message(
-            message.chat.id,
-            "🔄 Получение списка "
-            "просроченных заказов..."
-        )
-
-        overdue_orders_by_store = (
-            get_overdue_orders()
-        )
-
-        if not overdue_orders_by_store:
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Нет просроченных заказов "
-                "за указанный период."
-            )
-
-            return
-
-        response_text_orders = (
-            "📦 Задержанные заказы "
-            "по магазинам:\n\n"
-        )
-
-        for store, orders in (
-            overdue_orders_by_store.items()
-        ):
-
-            response_text_orders += (
-                f"Магазин {store}:\n"
-            )
-
-            for order_code in orders:
-
-                response_text_orders += (
-                    f"  🔸 Номер заказа: "
-                    f"{order_code}\n"
-                )
-
-            response_text_orders += "\n"
-
-        send_long_message(
-            message.chat.id,
-            response_text_orders
-        )
-
-        response_text_count = (
-            "📊 Статистика по "
-            "задержанным заказам:\n\n"
-        )
-
-        total_orders = 0
-
-        for store, orders in (
-            overdue_orders_by_store.items()
-        ):
-
-            response_text_count += (
-                f"{store}: "
-                f"{len(orders)} заказов\n"
-            )
-
-            total_orders += len(
-                orders
-            )
-
-        response_text_count += (
-            f"\n✅ Итого: "
-            f"{total_orders} заказов"
-        )
-
-        send_long_message(
-            message.chat.id,
-            response_text_count
-        )
-
-        file_name = create_excel(
-            overdue_orders_by_store,
-            sheet_name="Overdue Orders"
-        )
-
-        with open(
-            file_name,
-            'rb'
-        ) as file:
-
-            bot.send_document(
-                message.chat.id,
-                file
-            )
-
-        screenshot_filename = (
-            create_statistics_screenshot(
-                file_name
-            )
-        )
-
-        with open(
-            screenshot_filename,
-            'rb'
-        ) as img_file:
-
-            bot.send_photo(
-                message.chat.id,
-                img_file
-            )
-
-        if os.path.exists(
-            file_name
-        ):
-            os.remove(
-                file_name
-            )
-
-        if os.path.exists(
-            screenshot_filename
-        ):
-            os.remove(
-                screenshot_filename
-            )
-
-    except Exception as e:
-
-        logging.error(
-            f"/orders error: {e}"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            f"Произошла ошибка: {e}"
-        )
-
-
-# ============================================================
-# /PENDING_ORDERS
-# ============================================================
-
-@bot.message_handler(
-    commands=[
-        'pending_orders'
-    ]
-)
-def fetch_pending_orders(
-    message
-):
-
-    try:
-
-        bot.send_message(
-            message.chat.id,
-            "🔄 Получение списка заказов, "
-            "ожидающих передачи курьеру..."
-        )
-
-        pending_orders_by_store = (
-            get_pending_orders()
-        )
-
-        if not pending_orders_by_store:
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Нет заказов, "
-                "ожидающих передачи курьеру."
-            )
-
-            return
-
-        response_text_orders = (
-            "📦 Заказы, ожидающие "
-            "передачи курьеру:\n\n"
-        )
-
-        for store, orders in (
-            pending_orders_by_store.items()
-        ):
-
-            response_text_orders += (
-                f"Магазин {store}:\n"
-            )
-
-            for order_code in orders:
-
-                response_text_orders += (
-                    f"  🔸 Номер заказа: "
-                    f"{order_code}\n"
-                )
-
-            response_text_orders += "\n"
-
-        send_long_message(
-            message.chat.id,
-            response_text_orders
-        )
-
-        response_text_count = (
-            "📊 Статистика по "
-            "ожидающим заказам:\n\n"
-        )
-
-        total_orders = 0
-
-        for store, orders in (
-            pending_orders_by_store.items()
-        ):
-
-            response_text_count += (
-                f"{store}: "
-                f"{len(orders)} заказов\n"
-            )
-
-            total_orders += len(
-                orders
-            )
-
-        response_text_count += (
-            f"\n✅ Итого: "
-            f"{total_orders} заказов"
-        )
-
-        send_long_message(
-            message.chat.id,
-            response_text_count
-        )
-
-        file_name = create_excel(
-            pending_orders_by_store,
-            sheet_name="Pending Orders"
-        )
-
-        with open(
-            file_name,
-            'rb'
-        ) as file:
-
-            bot.send_document(
-                message.chat.id,
-                file
-            )
-
-        screenshot_filename = (
-            create_statistics_screenshot(
-                file_name
-            )
-        )
-
-        with open(
-            screenshot_filename,
-            'rb'
-        ) as img_file:
-
-            bot.send_photo(
-                message.chat.id,
-                img_file
-            )
-
-        if os.path.exists(
-            file_name
-        ):
-            os.remove(
-                file_name
-            )
-
-        if os.path.exists(
-            screenshot_filename
-        ):
-            os.remove(
-                screenshot_filename
-            )
-
-    except Exception as e:
-
-        logging.error(
-            f"/pending_orders error: {e}"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            f"Произошла ошибка: {e}"
-        )
-
-
-# ============================================================
-# /SEND_REPORT
-# ============================================================
-
-@bot.message_handler(
-    commands=[
-        'send_report'
-    ]
-)
-def send_report(
-    message
-):
-
-    try:
-
-        bot.send_message(
-            message.chat.id,
-            "🔄 Запуск отчета "
-            "по просроченным заказам..."
-        )
-
-        overdue_orders_by_store = (
-            get_overdue_orders()
-        )
-
-        if not overdue_orders_by_store:
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Нет просроченных заказов."
-            )
-
-            return
-
-        file_name = create_excel(
-            overdue_orders_by_store,
-            sheet_name="Overdue Orders"
-        )
-
-        email_body = (
-            "Good evening, "
-            "There are delayed orders "
-            "that were supposed to be "
-            "handed over to the courier today."
-            "<br><br>"
-            "Қайырлы кеш, "
-            "Төменде кешіккен тапсырыс саны."
-        )
-
-        success = send_email(
-            file_name,
-            subject="Delayed orders OMS",
-            email_body=email_body
-        )
-
-        if success:
-
-            bot.send_message(
-                message.chat.id,
-                "✅ Отчет успешно отправлен "
-                "по электронной почте."
-            )
-
-        else:
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Не удалось отправить отчет."
-            )
-
-    except Exception as e:
-
-        logging.error(
-            f"/send_report error: {e}"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            f"Произошла ошибка: {e}"
-        )
-
-
-# ============================================================
-# /SEND_PENDING_REPORT
-# ============================================================
-
-@bot.message_handler(
-    commands=[
-        'send_pending_report'
-    ]
-)
-def send_pending_report(
-    message
-):
-
-    try:
-
-        bot.send_message(
-            message.chat.id,
-            "🔄 Запуск отчета "
-            "по ожидающим заказам..."
-        )
-
-        pending_orders_by_store = (
-            get_pending_orders()
-        )
-
-        if not pending_orders_by_store:
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Нет заказов, "
-                "ожидающих передачи курьеру."
-            )
-
-            return
-
-        file_name = create_excel(
-            pending_orders_by_store,
-            sheet_name="Pending Orders"
-        )
-
-        email_body = (
-            "Қайырлы таң, "
-            "Төменде бүгін курьерге "
-            "жіберілуі керек тапсырыс саны."
-            "<br><br>"
-            "Good morning, "
-            "Attached are all pending orders "
-            "for courier handover today."
-        )
-
-        success = send_email(
-            file_name,
-            subject="Pending orders OMS",
-            email_body=email_body
-        )
-
-        if success:
-
-            bot.send_message(
-                message.chat.id,
-                "✅ Отчет успешно отправлен "
-                "по электронной почте."
-            )
-
-        else:
-
-            bot.send_message(
-                message.chat.id,
-                "❌ Не удалось отправить отчет."
-            )
-
-    except Exception as e:
-
-        logging.error(
-            f"/send_pending_report error: {e}"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            f"Произошла ошибка: {e}"
-        )
-
-
-# ============================================================
-# AUTO OVERDUE REPORT
-# ============================================================
-
-def job_overdue():
-
-    try:
-
-        logging.info(
-            "Запуск автоотправки "
-            "отчета overdue..."
-        )
-
-        overdue_orders_by_store = (
-            get_overdue_orders()
-        )
-
-        if not overdue_orders_by_store:
-
-            logging.info(
-                "Нет overdue заказов."
-            )
-
-            return
-
-        file_name = create_excel(
-            overdue_orders_by_store,
-            sheet_name="Overdue Orders"
-        )
-
-        email_body = (
-            "Good evening, "
-            "There are delayed orders "
-            "that were supposed to be "
-            "handed over to the courier today."
-            "<br><br>"
-            "Қайырлы кеш, "
-            "Төменде кешіккен тапсырыс саны."
-        )
-
-        send_email(
-            file_name,
-            subject="Delayed orders OMS",
-            email_body=email_body
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"job_overdue error: {e}"
-        )
-
-
-# ============================================================
-# AUTO PENDING REPORT
-# ============================================================
-
-def job_pending():
-
-    try:
-
-        logging.info(
-            "Запуск автоотправки "
-            "pending отчета..."
-        )
-
-        pending_orders_by_store = (
-            get_pending_orders()
-        )
-
-        if not pending_orders_by_store:
-
-            logging.info(
-                "Нет pending заказов."
-            )
-
-            return
-
-        file_name = create_excel(
-            pending_orders_by_store,
-            sheet_name="Pending Orders"
-        )
-
-        email_body = (
-            "Қайырлы таң, "
-            "Төменде бүгін курьерге "
-            "жіберілуі керек тапсырыс саны."
-            "<br><br>"
-            "Good morning, "
-            "Attached are all pending orders "
-            "for courier handover today."
-        )
-
-        send_email(
-            file_name,
-            subject="Pending orders OMS",
-            email_body=email_body
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"job_pending error: {e}"
-        )
-
-
-# ============================================================
-# SCHEDULE
-# ============================================================
-
-schedule.every().day.at(
-    "14:59"
-).do(
-    job_overdue
+TELEGRAM_API_KEY = os.getenv(
+    "TELEGRAM_API_KEY"
 )
 
-schedule.every().day.at(
-    "03:59"
-).do(
-    job_pending
+KASPI_AUTH_TOKEN = os.getenv(
+    "KASPI_AUTH_TOKEN"
+)
+
+WEBHOOK_URL = os.getenv(
+    "WEBHOOK_URL",
+    "https://nbot-n94j.onrender.com"
 )
 
 
-def run_scheduler():
-
-    while True:
-
-        try:
-
-            schedule.run_pending()
-
-            time.sleep(
-                1
-            )
-
-        except Exception as e:
-
-            logging.error(
-                f"Scheduler error: {e}"
-            )
-
-            time.sleep(
-                15
-            )
+if not TELEGRAM_API_KEY:
+    raise ValueError(
+        "TELEGRAM_API_KEY is not set"
+    )
 
 
-scheduler_thread = threading.Thread(
-    target=run_scheduler,
-    daemon=True
+if not KASPI_AUTH_TOKEN:
+    raise ValueError(
+        "KASPI_AUTH_TOKEN is not set"
+    )
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+bot = telebot.TeleBot(
+    TELEGRAM_API_KEY
 )
-
-scheduler_thread.start()
 
 
 # ============================================================
@@ -1777,72 +83,3282 @@ app = Flask(
 )
 
 
-@app.route(
-    '/' + API_KEY,
-    methods=[
-        'POST'
-    ]
-)
-def webhook():
+# ============================================================
+# TIMEZONE KAZAKHSTAN UTC+5
+# ============================================================
 
-    update = (
-        telebot.types.Update.de_json(
-            request.stream
-            .read()
-            .decode(
-                'utf-8'
+KZ_TZ = timezone(
+    timedelta(hours=5)
+)
+
+
+def now_kz():
+
+    return datetime.now(
+        KZ_TZ
+    )
+
+
+def today_kz():
+
+    return now_kz().date()
+
+
+# ============================================================
+# AUTOMATIC REPORT TIMES
+#
+# Можно менять через Render Environment:
+#
+# MORNING_REPORT_TIME=09:00
+# EVENING_REPORT_TIME=20:00
+# ============================================================
+
+MORNING_REPORT_TIME = os.getenv(
+    "MORNING_REPORT_TIME",
+    "09:00"
+)
+
+EVENING_REPORT_TIME = os.getenv(
+    "EVENING_REPORT_TIME",
+    "20:00"
+)
+
+
+# ============================================================
+# KASPI
+# ============================================================
+
+KASPI_API_URL = (
+    "https://kaspi.kz/shop/api/v2/orders"
+)
+
+
+# ============================================================
+# STORE MAPPING
+# ============================================================
+
+STORE_MAPPING = {
+
+    "14576033_9005":
+        "Karaganda Tair",
+
+    "14576033_9020":
+        "Almaty Mart",
+
+    "14576033_9003":
+        "Almaty Aport",
+
+    "14576033_9080":
+        "Astana InStreet",
+
+    "14576033_9078":
+        "Aktobe InStreet",
+
+    "14576033_9077":
+        "Almaty InStreet",
+
+    "14576033_9004":
+        "Shym Bayan Sulu",
+
+    "14576033_9104":
+        "Astana Reebok",
+
+    "14576033_9006":
+        "Astana Asia Park",
+
+    "14576033_9101":
+        "Aktobe Reebok",
+
+    "14576033_9041":
+        "Almaty Warehouse"
+}
+
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
+
+commands = [
+
+    BotCommand(
+        "start",
+        "Главное меню"
+    ),
+
+    BotCommand(
+        "db_test",
+        "Проверить подключение к БД"
+    ),
+
+    BotCommand(
+        "morning",
+        "Создать Morning Snapshot"
+    ),
+
+    BotCommand(
+        "pending_orders",
+        "Заказы на передачу сегодня"
+    ),
+
+    BotCommand(
+        "orders",
+        "Текущие задержанные заказы"
+    ),
+
+    BotCommand(
+        "open_delays",
+        "Текущие Open Delays"
+    ),
+
+    BotCommand(
+        "daily_otd",
+        "Рассчитать OTD за сегодня"
+    ),
+
+    BotCommand(
+        "history",
+        "OTD история за 7 дней"
+    )
+]
+
+
+try:
+
+    bot.set_my_commands(
+        commands
+    )
+
+except Exception:
+
+    logging.exception(
+        "Failed to set Telegram commands"
+    )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def send_long_message(
+    chat_id,
+    text
+):
+
+    if not text:
+        return
+
+    max_length = 4000
+
+    while text:
+
+        if len(text) <= max_length:
+
+            bot.send_message(
+                chat_id,
+                text
+            )
+
+            break
+
+        split_position = (
+            text.rfind(
+                "\n",
+                0,
+                max_length
+            )
+        )
+
+        if split_position == -1:
+
+            split_position = (
+                max_length
+            )
+
+        part = text[
+            :split_position
+        ]
+
+        bot.send_message(
+            chat_id,
+            part
+        )
+
+        text = text[
+            split_position:
+        ].lstrip()
+
+
+# ============================================================
+# TIMESTAMP CONVERSION
+# ============================================================
+
+def timestamp_to_datetime(
+    value
+):
+
+    if not value:
+
+        return None
+
+    try:
+
+        return datetime.fromtimestamp(
+            int(value) / 1000,
+            tz=KZ_TZ
+        )
+
+    except Exception:
+
+        logging.exception(
+            "Failed to convert timestamp"
+        )
+
+        return None
+
+
+# ============================================================
+# KASPI HEADERS
+# ============================================================
+
+def get_kaspi_headers():
+
+    return {
+
+        "X-Auth-Token":
+            KASPI_AUTH_TOKEN,
+
+        "Accept":
+            "application/vnd.api+json;charset=UTF-8",
+
+        "Content-Type":
+            "application/vnd.api+json",
+
+        "User-Agent":
+            "OMS-KZ-OTD-Bot/2.0"
+    }
+
+
+# ============================================================
+# KASPI REQUEST
+# ============================================================
+
+def kaspi_get(
+    params,
+    attempts=3
+):
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        attempts + 1
+    ):
+
+        try:
+
+            response = requests.get(
+
+                KASPI_API_URL,
+
+                headers=
+                    get_kaspi_headers(),
+
+                params=
+                    params,
+
+                timeout=
+                    30
+            )
+
+
+            logging.info(
+                "Kaspi API | "
+                f"status={response.status_code} | "
+                f"attempt={attempt}"
+            )
+
+
+            response.raise_for_status()
+
+
+            return response.json()
+
+
+        except Exception as e:
+
+            last_error = e
+
+            logging.error(
+                "Kaspi request failed | "
+                f"attempt={attempt} | "
+                f"{e}"
+            )
+
+
+            if attempt < attempts:
+
+                time.sleep(
+                    attempt * 2
+                )
+
+
+    raise last_error
+
+
+# ============================================================
+# PARSE KASPI ORDER
+# ============================================================
+
+def parse_kaspi_order(
+    raw_order,
+    current_time=None
+):
+
+    if current_time is None:
+
+        current_time = (
+            now_kz()
+        )
+
+
+    attributes = raw_order.get(
+        "attributes",
+        {}
+    )
+
+
+    order_code = str(
+        attributes.get(
+            "code",
+            ""
+        )
+    ).strip()
+
+
+    pickup_point_id = str(
+        attributes.get(
+            "pickupPointId",
+            ""
+        )
+    ).strip()
+
+
+    store_name = (
+        STORE_MAPPING.get(
+            pickup_point_id,
+            pickup_point_id
+            or "Unknown Store"
+        )
+    )
+
+
+    current_status = (
+
+        attributes.get(
+            "status"
+        )
+
+        or
+
+        "UNKNOWN"
+    )
+
+
+    creation_date = (
+        timestamp_to_datetime(
+            attributes.get(
+                "creationDate"
             )
         )
     )
 
-    bot.process_new_updates(
-        [
-            update
-        ]
+
+    # Некоторые ответы Kaspi могут содержать
+    # поля передачи как внутри kaspiDelivery,
+    # так и напрямую в attributes.
+
+    kaspi_delivery = (
+
+        attributes.get(
+            "kaspiDelivery"
+        )
+
+        or
+
+        {}
     )
 
-    return 'ok', 200
+
+    planned_raw = (
+
+        attributes.get(
+            "courierTransmissionPlanningDate"
+        )
+
+        or
+
+        kaspi_delivery.get(
+            "courierTransmissionPlanningDate"
+        )
+    )
 
 
-@app.route('/')
-def index():
+    actual_raw = (
+
+        attributes.get(
+            "courierTransmissionDate"
+        )
+
+        or
+
+        kaspi_delivery.get(
+            "courierTransmissionDate"
+        )
+    )
+
+
+    planned_date = (
+        timestamp_to_datetime(
+            planned_raw
+        )
+    )
+
+
+    actual_date = (
+        timestamp_to_datetime(
+            actual_raw
+        )
+    )
+
+
+    is_cancelled = (
+
+        str(
+            current_status
+        ).upper()
+
+        ==
+
+        "CANCELLED"
+    )
+
+
+    was_delayed = False
+
+    is_currently_delayed = False
+
+    delay_started_at = None
+
+    delay_resolved_at = None
+
+    delay_minutes = 0
+
+
+    # --------------------------------------------------------
+    # DELAY LOGIC
+    # --------------------------------------------------------
+
+    if (
+        not is_cancelled
+        and
+        planned_date
+    ):
+
+        # -----------------------------------
+        # ALREADY HANDED TO COURIER
+        # -----------------------------------
+
+        if actual_date:
+
+            if (
+                actual_date
+                >
+                planned_date
+            ):
+
+                was_delayed = True
+
+                is_currently_delayed = False
+
+                delay_started_at = (
+                    planned_date
+                )
+
+                delay_resolved_at = (
+                    actual_date
+                )
+
+                delay_minutes = max(
+
+                    0,
+
+                    int(
+
+                        (
+                            actual_date
+                            -
+                            planned_date
+                        ).total_seconds()
+
+                        / 60
+                    )
+                )
+
+
+        # -----------------------------------
+        # NOT HANDED TO COURIER YET
+        # -----------------------------------
+
+        else:
+
+            if (
+                current_time
+                >
+                planned_date
+            ):
+
+                was_delayed = True
+
+                is_currently_delayed = True
+
+                delay_started_at = (
+                    planned_date
+                )
+
+                delay_minutes = max(
+
+                    0,
+
+                    int(
+
+                        (
+                            current_time
+                            -
+                            planned_date
+                        ).total_seconds()
+
+                        / 60
+                    )
+                )
+
+
+    return {
+
+        "order_code":
+            order_code,
+
+        "pickup_point_id":
+            pickup_point_id,
+
+        "store_name":
+            store_name,
+
+        "creation_date":
+            creation_date,
+
+        "planned_transmission_date":
+            planned_date,
+
+        "actual_transmission_date":
+            actual_date,
+
+        "current_status":
+            current_status,
+
+        "is_cancelled":
+            is_cancelled,
+
+        "was_delayed":
+            was_delayed,
+
+        "is_currently_delayed":
+            is_currently_delayed,
+
+        "delay_started_at":
+            delay_started_at,
+
+        "delay_resolved_at":
+            delay_resolved_at,
+
+        "delay_minutes":
+            delay_minutes
+    }
+
+
+# ============================================================
+# FETCH ACCEPTED ORDERS
+# ============================================================
+
+def fetch_accepted_orders(
+    lookback_days=14
+):
+
+    current_time = (
+        now_kz()
+    )
+
+
+    start_time = (
+
+        current_time
+        -
+        timedelta(
+            days=lookback_days
+        )
+    )
+
+
+    page = 0
+
+    result = []
+
+
+    while True:
+
+        params = {
+
+            "page[number]":
+                page,
+
+            "page[size]":
+                100,
+
+            "filter[orders][creationDate][$ge]":
+
+                int(
+                    start_time.timestamp()
+                    * 1000
+                ),
+
+            "filter[orders][creationDate][$le]":
+
+                int(
+                    current_time.timestamp()
+                    * 1000
+                ),
+
+            "filter[orders][status]":
+                "ACCEPTED_BY_MERCHANT",
+
+            "filter[orders][state]":
+                "KASPI_DELIVERY"
+        }
+
+
+        data = kaspi_get(
+            params
+        )
+
+
+        orders = data.get(
+            "data",
+            []
+        )
+
+
+        result.extend(
+            orders
+        )
+
+
+        if len(
+            orders
+        ) < 100:
+
+            break
+
+
+        page += 1
+
+
+    logging.info(
+        "Accepted Kaspi orders fetched | "
+        f"{len(result)}"
+    )
+
+
+    return result
+
+
+# ============================================================
+# FETCH ORDER BY CODE
+# ============================================================
+
+def fetch_order_by_code(
+    order_code
+):
+
+    params = {
+
+        "filter[orders][code]":
+            str(order_code),
+
+        "page[number]":
+            0,
+
+        "page[size]":
+            100
+    }
+
+
+    data = kaspi_get(
+        params
+    )
+
+
+    orders = data.get(
+        "data",
+        []
+    )
+
+
+    if not orders:
+
+        return None
+
+
+    # Ищем точное совпадение
+
+    for raw_order in orders:
+
+        attributes = (
+            raw_order.get(
+                "attributes",
+                {}
+            )
+        )
+
+        code = str(
+            attributes.get(
+                "code",
+                ""
+            )
+        )
+
+
+        if (
+            code
+            ==
+            str(order_code)
+        ):
+
+            return raw_order
+
+
+    return orders[0]
+
+
+# ============================================================
+# SAVE PARSED ORDER
+# ============================================================
+
+def save_parsed_order(
+    parsed_order
+):
+
+    if not parsed_order.get(
+        "order_code"
+    ):
+
+        logging.warning(
+            "Order without order_code skipped"
+        )
+
+        return None
+
+
+    saved_order = (
+        upsert_order(
+            parsed_order
+        )
+    )
+
+
+    if saved_order:
+
+        save_status_history(
+
+            saved_order[
+                "id"
+            ],
+
+            parsed_order
+        )
+
+
+    return saved_order
+
+
+# ============================================================
+# MORNING SNAPSHOT
+# ============================================================
+
+def create_morning_snapshot(
+    report_date=None
+):
+
+    if report_date is None:
+
+        report_date = (
+            today_kz()
+        )
+
+
+    current_time = (
+        now_kz()
+    )
+
+
+    raw_orders = (
+        fetch_accepted_orders()
+    )
+
+
+    today_orders = []
+
+
+    for raw_order in raw_orders:
+
+        parsed_order = (
+            parse_kaspi_order(
+
+                raw_order,
+
+                current_time
+            )
+        )
+
+
+        planned_date = (
+            parsed_order.get(
+                "planned_transmission_date"
+            )
+        )
+
+
+        if not planned_date:
+
+            continue
+
+
+        # ----------------------------------------------------
+        # ВАЖНО
+        #
+        # Берем заказ только если
+        # courierTransmissionPlanningDate
+        # соответствует report_date.
+        #
+        # Для 9041 никаких исключений нет.
+        # ----------------------------------------------------
+
+        if (
+            planned_date.date()
+            !=
+            report_date
+        ):
+
+            continue
+
+
+        saved_order = (
+            save_parsed_order(
+                parsed_order
+            )
+        )
+
+
+        if not saved_order:
+
+            continue
+
+
+        mark_order_morning_snapshot(
+
+            saved_order[
+                "id"
+            ],
+
+            report_date
+        )
+
+
+        parsed_order[
+            "was_on_time"
+        ] = False
+
+
+        parsed_order[
+            "snapshot_delayed"
+        ] = False
+
+
+        save_daily_snapshot(
+
+            report_date,
+
+            saved_order[
+                "id"
+            ],
+
+            parsed_order
+        )
+
+
+        today_orders.append(
+            parsed_order
+        )
+
+
+    logging.info(
+        "Morning Snapshot | "
+        f"date={report_date} | "
+        f"orders={len(today_orders)}"
+    )
+
+
+    return today_orders
+
+
+# ============================================================
+# REFRESH ONE ORDER
+# ============================================================
+
+def refresh_order(
+    order_code
+):
+
+    raw_order = (
+        fetch_order_by_code(
+            order_code
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # ВАЖНО
+    #
+    # Если заказ временно не вернулся из API,
+    # НЕ считаем его автоматически отмененным.
+    # --------------------------------------------------------
+
+    if not raw_order:
+
+        logging.warning(
+            "Order not found in Kaspi | "
+            f"{order_code}"
+        )
+
+        return None
+
+
+    parsed_order = (
+        parse_kaspi_order(
+            raw_order
+        )
+    )
+
+
+    saved_order = (
+        save_parsed_order(
+            parsed_order
+        )
+    )
+
 
     return (
-        'NBOT is running'
+        parsed_order,
+        saved_order
     )
 
 
 # ============================================================
-# START
+# REFRESH OPEN DELAYS
 # ============================================================
 
-if __name__ == '__main__':
+def refresh_open_delays():
+
+    open_orders = (
+        get_open_delays()
+    )
+
+
+    refreshed = 0
+
+
+    for order in open_orders:
+
+        try:
+
+            result = (
+                refresh_order(
+                    order[
+                        "order_code"
+                    ]
+                )
+            )
+
+
+            if result:
+
+                refreshed += 1
+
+
+            # чтобы не отправлять слишком
+            # много запросов одновременно
+
+            time.sleep(
+                0.15
+            )
+
+
+        except Exception:
+
+            logging.exception(
+                "Failed to refresh open delay | "
+                f"{order['order_code']}"
+            )
+
+
+    logging.info(
+        "Open delays refreshed | "
+        f"{refreshed}"
+    )
+
+
+    return refreshed
+
+
+# ============================================================
+# FINALIZE DAILY OTD
+# ============================================================
+
+def finalize_daily_otd(
+    report_date=None
+):
+
+    if report_date is None:
+
+        report_date = (
+            today_kz()
+        )
+
+
+    snapshots = (
+        get_snapshot_orders(
+            report_date
+        )
+    )
+
+
+    if not snapshots:
+
+        logging.warning(
+            "No Morning Snapshot | "
+            f"{report_date}"
+        )
+
+        return []
+
+
+    # --------------------------------------------------------
+    # Обновляем старые открытые задержки
+    # --------------------------------------------------------
+
+    refresh_open_delays()
+
+
+    current_time = (
+        now_kz()
+    )
+
+
+    final_orders = []
+
+
+    for snapshot in snapshots:
+
+        order_code = str(
+            snapshot[
+                "order_code"
+            ]
+        )
+
+
+        try:
+
+            raw_order = (
+                fetch_order_by_code(
+                    order_code
+                )
+            )
+
+
+            # =================================================
+            # ORDER FOUND IN KASPI
+            # =================================================
+
+            if raw_order:
+
+                parsed_order = (
+                    parse_kaspi_order(
+
+                        raw_order,
+
+                        current_time
+                    )
+                )
+
+
+                saved_order = (
+                    save_parsed_order(
+                        parsed_order
+                    )
+                )
+
+
+            # =================================================
+            # ORDER NOT RETURNED BY API
+            #
+            # Не считаем CANCELLED автоматически.
+            # Используем последнюю известную запись из БД.
+            # =================================================
+
+            else:
+
+                existing_order = (
+                    get_order_by_code(
+                        order_code
+                    )
+                )
+
+
+                if not existing_order:
+
+                    logging.warning(
+                        "Order missing both "
+                        "in Kaspi and DB | "
+                        f"{order_code}"
+                    )
+
+                    continue
+
+
+                parsed_order = {
+
+                    "order_code":
+                        order_code,
+
+                    "pickup_point_id":
+                        existing_order[
+                            "pickup_point_id"
+                        ],
+
+                    "store_name":
+                        existing_order[
+                            "store_name"
+                        ],
+
+                    "creation_date":
+                        existing_order[
+                            "creation_date"
+                        ],
+
+                    "planned_transmission_date":
+                        existing_order[
+                            "planned_transmission_date"
+                        ],
+
+                    "actual_transmission_date":
+                        existing_order[
+                            "actual_transmission_date"
+                        ],
+
+                    "current_status":
+                        existing_order[
+                            "current_status"
+                        ],
+
+                    "is_cancelled":
+                        existing_order[
+                            "is_cancelled"
+                        ],
+
+                    "was_delayed":
+                        existing_order[
+                            "was_delayed"
+                        ],
+
+                    "is_currently_delayed":
+                        existing_order[
+                            "is_currently_delayed"
+                        ],
+
+                    "delay_started_at":
+                        existing_order[
+                            "delay_started_at"
+                        ],
+
+                    "delay_resolved_at":
+                        existing_order[
+                            "delay_resolved_at"
+                        ],
+
+                    "delay_minutes":
+
+                        existing_order[
+                            "delay_minutes"
+                        ]
+
+                        or
+
+                        0
+                }
+
+
+                saved_order = (
+                    existing_order
+                )
+
+
+            # =================================================
+            # OTD CALCULATION FOR THIS ORDER
+            # =================================================
+
+            planned_date = (
+                parsed_order.get(
+                    "planned_transmission_date"
+                )
+            )
+
+
+            actual_date = (
+                parsed_order.get(
+                    "actual_transmission_date"
+                )
+            )
+
+
+            is_cancelled = bool(
+                parsed_order.get(
+                    "is_cancelled"
+                )
+            )
+
+
+            was_on_time = False
+
+            delayed_for_otd = False
+
+            delay_minutes = 0
+
+
+            # CANCELLED исключается из OTD
+
+            if (
+                not is_cancelled
+                and
+                planned_date
+            ):
+
+                # ---------------------------------------------
+                # ACTUAL HANDOVER EXISTS
+                # ---------------------------------------------
+
+                if actual_date:
+
+                    if (
+                        actual_date
+                        <=
+                        planned_date
+                    ):
+
+                        was_on_time = True
+
+                    else:
+
+                        delayed_for_otd = True
+
+
+                        delay_minutes = max(
+
+                            0,
+
+                            int(
+
+                                (
+                                    actual_date
+                                    -
+                                    planned_date
+                                ).total_seconds()
+
+                                / 60
+                            )
+                        )
+
+
+                # ---------------------------------------------
+                # NO ACTUAL HANDOVER
+                # ---------------------------------------------
+
+                else:
+
+                    if (
+                        current_time
+                        >
+                        planned_date
+                    ):
+
+                        delayed_for_otd = True
+
+
+                        delay_minutes = max(
+
+                            0,
+
+                            int(
+
+                                (
+                                    current_time
+                                    -
+                                    planned_date
+                                ).total_seconds()
+
+                                / 60
+                            )
+                        )
+
+
+            parsed_order[
+                "was_on_time"
+            ] = was_on_time
+
+
+            parsed_order[
+                "snapshot_delayed"
+            ] = delayed_for_otd
+
+
+            parsed_order[
+                "delay_minutes"
+            ] = delay_minutes
+
+
+            save_daily_snapshot(
+
+                report_date,
+
+                saved_order[
+                    "id"
+                ],
+
+                parsed_order
+            )
+
+
+            final_orders.append(
+                parsed_order
+            )
+
+
+            time.sleep(
+                0.15
+            )
+
+
+        except Exception:
+
+            logging.exception(
+                "OTD processing failed | "
+                f"{order_code}"
+            )
+
+
+    # ========================================================
+    # GROUP BY STORE
+    # ========================================================
+
+    store_data = {}
+
+
+    for order in final_orders:
+
+        store_name = (
+            order[
+                "store_name"
+            ]
+        )
+
+
+        if store_name not in store_data:
+
+            store_data[
+                store_name
+            ] = {
+
+                "pickup_point_id":
+                    order[
+                        "pickup_point_id"
+                    ],
+
+                "morning_orders":
+                    0,
+
+                "cancelled_orders":
+                    0,
+
+                "on_time_orders":
+                    0,
+
+                "delayed_orders":
+                    0
+            }
+
+
+        row = (
+            store_data[
+                store_name
+            ]
+        )
+
+
+        row[
+            "morning_orders"
+        ] += 1
+
+
+        if order.get(
+            "is_cancelled"
+        ):
+
+            row[
+                "cancelled_orders"
+            ] += 1
+
+
+        elif order.get(
+            "was_on_time"
+        ):
+
+            row[
+                "on_time_orders"
+            ] += 1
+
+
+        elif order.get(
+            "snapshot_delayed"
+        ):
+
+            row[
+                "delayed_orders"
+            ] += 1
+
+
+    # ========================================================
+    # OPEN DELAYS BY STORE
+    # ========================================================
+
+    open_delays = (
+        get_open_delays()
+    )
+
+
+    open_by_store = {}
+
+
+    for order in open_delays:
+
+        store_name = (
+            order[
+                "store_name"
+            ]
+        )
+
+
+        open_by_store[
+            store_name
+        ] = (
+
+            open_by_store.get(
+                store_name,
+                0
+            )
+
+            +
+
+            1
+        )
+
+
+    # ========================================================
+    # SAVE DAILY OTD
+    # ========================================================
+
+    result = []
+
+
+    for (
+        store_name,
+        row
+    ) in store_data.items():
+
+
+        morning_orders = (
+            row[
+                "morning_orders"
+            ]
+        )
+
+
+        cancelled_orders = (
+            row[
+                "cancelled_orders"
+            ]
+        )
+
+
+        actual_orders = max(
+
+            0,
+
+            morning_orders
+            -
+            cancelled_orders
+        )
+
+
+        on_time_orders = (
+            row[
+                "on_time_orders"
+            ]
+        )
+
+
+        delayed_orders = (
+            row[
+                "delayed_orders"
+            ]
+        )
+
+
+        if actual_orders > 0:
+
+            otd_percent = round(
+
+                on_time_orders
+                /
+                actual_orders
+                *
+                100,
+
+                2
+            )
+
+        else:
+
+            otd_percent = None
+
+
+        open_delay_count = (
+            open_by_store.get(
+                store_name,
+                0
+            )
+        )
+
+
+        save_daily_otd(
+
+            report_date=
+                report_date,
+
+            store_name=
+                store_name,
+
+            pickup_point_id=
+                row[
+                    "pickup_point_id"
+                ],
+
+            morning_orders=
+                morning_orders,
+
+            cancelled_orders=
+                cancelled_orders,
+
+            actual_orders=
+                actual_orders,
+
+            on_time_orders=
+                on_time_orders,
+
+            delayed_orders=
+                delayed_orders,
+
+            otd_percent=
+                otd_percent,
+
+            open_delays=
+                open_delay_count
+        )
+
+
+        result.append({
+
+            "store_name":
+                store_name,
+
+            "pickup_point_id":
+                row[
+                    "pickup_point_id"
+                ],
+
+            "morning_orders":
+                morning_orders,
+
+            "cancelled_orders":
+                cancelled_orders,
+
+            "actual_orders":
+                actual_orders,
+
+            "on_time_orders":
+                on_time_orders,
+
+            "delayed_orders":
+                delayed_orders,
+
+            "otd_percent":
+                otd_percent,
+
+            "open_delays":
+                open_delay_count
+        })
+
+
+    logging.info(
+        "Daily OTD finalized | "
+        f"date={report_date} | "
+        f"stores={len(result)}"
+    )
+
+
+    return result
+
+
+# ============================================================
+# OTD COLOR
+# ============================================================
+
+def otd_icon(
+    value
+):
+
+    if value is None:
+
+        return "⚪"
+
+
+    value = float(
+        value
+    )
+
+
+    if value >= 95:
+
+        return "🟢"
+
+
+    if value >= 90:
+
+        return "🟡"
+
+
+    if value >= 85:
+
+        return "🟠"
+
+
+    return "🔴"
+
+
+# ============================================================
+# START / HELP
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "start"
+    ]
+)
+def start_command(
+    message
+):
+
+    text = (
+        "📊 OMS KZ REPORT BOT\n\n"
+
+        "Доступные команды:\n\n"
+
+        "☀️ /morning\n"
+        "Создать Morning Snapshot\n\n"
+
+        "📦 /pending_orders\n"
+        "Заказы на передачу сегодня\n\n"
+
+        "🚨 /orders\n"
+        "Текущие задержанные заказы\n\n"
+
+        "⏳ /open_delays\n"
+        "Open Delays\n\n"
+
+        "🌙 /daily_otd\n"
+        "Рассчитать OTD за сегодня\n\n"
+
+        "📅 /history\n"
+        "OTD за последние 7 дней\n\n"
+
+        "🗄 /db_test\n"
+        "Проверить базу данных"
+    )
+
+
+    bot.send_message(
+        message.chat.id,
+        text
+    )
+
+
+# ============================================================
+# DB TEST
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "db_test"
+    ]
+)
+def db_test_command(
+    message
+):
+
+    try:
+
+        bot.send_message(
+            message.chat.id,
+            "🔄 Проверяю Supabase..."
+        )
+
+
+        success, info = (
+            test_connection()
+        )
+
+
+        if not success:
+
+            bot.send_message(
+
+                message.chat.id,
+
+                "❌ Database connection failed\n\n"
+
+                f"{info}"
+            )
+
+            return
+
+
+        counts = (
+            get_table_counts()
+        )
+
+
+        if counts is None:
+
+            bot.send_message(
+                message.chat.id,
+                "⚠️ База подключена, "
+                "но таблицы прочитать "
+                "не удалось."
+            )
+
+            return
+
+
+        text = (
+
+            "✅ SUPABASE CONNECTED\n\n"
+
+            f"📦 Orders: "
+            f"{counts['orders']}\n"
+
+            f"📝 Order History: "
+            f"{counts['order_status_history']}\n"
+
+            f"☀️ Daily Snapshots: "
+            f"{counts['daily_order_snapshot']}\n"
+
+            f"📈 Daily OTD: "
+            f"{counts['daily_otd']}"
+        )
+
+
+        bot.send_message(
+            message.chat.id,
+            text
+        )
+
+
+    except Exception as e:
+
+        logging.exception(
+            "DB test failed"
+        )
+
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
+
+
+# ============================================================
+# MORNING COMMAND
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "morning"
+    ]
+)
+def morning_command(
+    message
+):
+
+    try:
+
+        bot.send_message(
+            message.chat.id,
+            "☀️ Создаю Morning Snapshot..."
+        )
+
+
+        orders = (
+            create_morning_snapshot()
+        )
+
+
+        by_store = {}
+
+
+        for order in orders:
+
+            store_name = (
+                order[
+                    "store_name"
+                ]
+            )
+
+
+            by_store[
+                store_name
+            ] = (
+
+                by_store.get(
+                    store_name,
+                    0
+                )
+
+                +
+
+                1
+            )
+
+
+        open_delays = (
+            get_open_delays()
+        )
+
+
+        text = (
+
+            "☀️ MORNING REPORT\n"
+
+            f"{today_kz().strftime('%d.%m.%Y')}\n\n"
+        )
+
+
+        total = 0
+
+
+        if by_store:
+
+            for store_name in sorted(
+                by_store
+            ):
+
+                count = (
+                    by_store[
+                        store_name
+                    ]
+                )
+
+
+                total += count
+
+
+                text += (
+
+                    f"🏬 {store_name}: "
+
+                    f"{count}\n"
+                )
+
+        else:
+
+            text += (
+                "На сегодня заказов "
+                "по Planned Date не найдено.\n"
+            )
+
+
+        text += (
+
+            "\n"
+
+            f"📦 Planned Today: "
+            f"{total}\n"
+
+            f"🚨 Previous Open Delays: "
+            f"{len(open_delays)}"
+        )
+
+
+        send_long_message(
+            message.chat.id,
+            text
+        )
+
+
+    except Exception as e:
+
+        logging.exception(
+            "Morning command failed"
+        )
+
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
+
+
+# ============================================================
+# PENDING ORDERS
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "pending_orders"
+    ]
+)
+def pending_orders_command(
+    message
+):
+
+    try:
+
+        bot.send_message(
+            message.chat.id,
+            "🔄 Получаю Pending Orders..."
+        )
+
+
+        raw_orders = (
+            fetch_accepted_orders()
+        )
+
+
+        current_time = (
+            now_kz()
+        )
+
+
+        grouped = {}
+
+
+        for raw_order in raw_orders:
+
+            order = (
+                parse_kaspi_order(
+
+                    raw_order,
+
+                    current_time
+                )
+            )
+
+
+            planned_date = (
+                order.get(
+                    "planned_transmission_date"
+                )
+            )
+
+
+            if not planned_date:
+
+                continue
+
+
+            # Только planned today
+
+            if (
+                planned_date.date()
+                !=
+                today_kz()
+            ):
+
+                continue
+
+
+            # Уже передан курьеру
+
+            if order.get(
+                "actual_transmission_date"
+            ):
+
+                continue
+
+
+            # Отмененный
+
+            if order.get(
+                "is_cancelled"
+            ):
+
+                continue
+
+
+            store_name = (
+                order[
+                    "store_name"
+                ]
+            )
+
+
+            grouped.setdefault(
+                store_name,
+                []
+            )
+
+
+            grouped[
+                store_name
+            ].append(
+                order
+            )
+
+
+        if not grouped:
+
+            bot.send_message(
+                message.chat.id,
+                "✅ Нет заказов, ожидающих "
+                "передачи сегодня."
+            )
+
+            return
+
+
+        text = (
+
+            "📦 PENDING ORDERS\n"
+
+            f"{today_kz().strftime('%d.%m.%Y')}\n\n"
+        )
+
+
+        total = 0
+
+
+        for store_name in sorted(
+            grouped
+        ):
+
+            store_orders = (
+                grouped[
+                    store_name
+                ]
+            )
+
+
+            total += len(
+                store_orders
+            )
+
+
+            text += (
+
+                f"🏬 {store_name} "
+
+                f"({len(store_orders)})\n"
+            )
+
+
+            for order in store_orders:
+
+                planned_date = (
+                    order[
+                        "planned_transmission_date"
+                    ]
+                )
+
+
+                planned_text = (
+
+                    planned_date.strftime(
+                        "%H:%M"
+                    )
+
+                    if planned_date
+
+                    else
+
+                    "-"
+                )
+
+
+                text += (
+
+                    f"• {order['order_code']}"
+
+                    f" | {planned_text}\n"
+                )
+
+
+            text += "\n"
+
+
+        text += (
+            f"📊 Total: {total}"
+        )
+
+
+        send_long_message(
+            message.chat.id,
+            text
+        )
+
+
+    except Exception as e:
+
+        logging.exception(
+            "Pending orders failed"
+        )
+
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
+
+
+# ============================================================
+# OPEN DELAYS TEXT
+# ============================================================
+
+def build_open_delays_text():
+
+    orders = (
+        get_open_delays()
+    )
+
+
+    if not orders:
+
+        return (
+
+            "✅ OPEN DELAYS\n\n"
+
+            "Нет открытых задержек."
+        )
+
+
+    current_time = (
+        now_kz()
+    )
+
+
+    grouped = {}
+
+
+    for order in orders:
+
+        store_name = (
+            order[
+                "store_name"
+            ]
+        )
+
+
+        grouped.setdefault(
+            store_name,
+            []
+        )
+
+
+        grouped[
+            store_name
+        ].append(
+            order
+        )
+
+
+    text = (
+
+        "🚨 OPEN DELAYS\n"
+
+        f"{today_kz().strftime('%d.%m.%Y')}\n\n"
+    )
+
+
+    for store_name in sorted(
+        grouped
+    ):
+
+        store_orders = (
+            grouped[
+                store_name
+            ]
+        )
+
+
+        text += (
+
+            f"🏬 {store_name} "
+
+            f"({len(store_orders)})\n"
+        )
+
+
+        for order in store_orders:
+
+            planned_date = (
+                order.get(
+                    "planned_transmission_date"
+                )
+            )
+
+
+            if planned_date:
+
+                if (
+                    planned_date.tzinfo
+                    is None
+                ):
+
+                    planned_date = (
+                        planned_date.replace(
+                            tzinfo=KZ_TZ
+                        )
+                    )
+
+
+                local_planned = (
+                    planned_date.astimezone(
+                        KZ_TZ
+                    )
+                )
+
+
+                delta = (
+                    current_time
+                    -
+                    local_planned
+                )
+
+
+                total_minutes = max(
+
+                    0,
+
+                    int(
+                        delta.total_seconds()
+                        / 60
+                    )
+                )
+
+
+                total_hours = (
+                    total_minutes
+                    // 60
+                )
+
+
+                days_difference = (
+
+                    current_time.date()
+                    -
+                    local_planned.date()
+                ).days
+
+
+                planned_text = (
+                    local_planned.strftime(
+                        "%d.%m.%Y %H:%M"
+                    )
+                )
+
+
+            else:
+
+                total_minutes = 0
+
+                total_hours = 0
+
+                days_difference = 0
+
+                planned_text = "-"
+
+
+            if days_difference >= 3:
+
+                delay_text = (
+                    f"🔴 {days_difference} days"
+                )
+
+
+            elif days_difference == 2:
+
+                delay_text = (
+                    "🟠 2 days"
+                )
+
+
+            elif days_difference == 1:
+
+                delay_text = (
+                    "🟡 1 day"
+                )
+
+
+            else:
+
+                delay_text = (
+                    f"⚠️ {total_hours}h"
+                )
+
+
+            text += (
+
+                f"• {order['order_code']}\n"
+
+                f"  Planned: "
+                f"{planned_text}\n"
+
+                f"  Delay: "
+                f"{delay_text}\n"
+            )
+
+
+        text += "\n"
+
+
+    text += (
+
+        f"📊 Total Open: "
+        f"{len(orders)}"
+    )
+
+
+    return text
+
+
+# ============================================================
+# ORDERS / OPEN DELAYS COMMAND
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "orders",
+        "open_delays"
+    ]
+)
+def open_delays_command(
+    message
+):
+
+    try:
+
+        bot.send_message(
+            message.chat.id,
+            "🔄 Обновляю Open Delays..."
+        )
+
+
+        refresh_open_delays()
+
+
+        text = (
+            build_open_delays_text()
+        )
+
+
+        send_long_message(
+            message.chat.id,
+            text
+        )
+
+
+    except Exception as e:
+
+        logging.exception(
+            "Open delays failed"
+        )
+
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
+
+
+# ============================================================
+# DAILY OTD COMMAND
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "daily_otd"
+    ]
+)
+def daily_otd_command(
+    message
+):
+
+    try:
+
+        bot.send_message(
+            message.chat.id,
+            "🌙 Рассчитываю Daily OTD..."
+        )
+
+
+        rows = (
+            finalize_daily_otd()
+        )
+
+
+        if not rows:
+
+            bot.send_message(
+
+                message.chat.id,
+
+                "⚠️ Morning Snapshot "
+                "на сегодня отсутствует.\n\n"
+
+                "Сначала запусти /morning"
+            )
+
+            return
+
+
+        total_morning = sum(
+
+            row[
+                "morning_orders"
+            ]
+
+            for row in rows
+        )
+
+
+        total_cancelled = sum(
+
+            row[
+                "cancelled_orders"
+            ]
+
+            for row in rows
+        )
+
+
+        total_actual = sum(
+
+            row[
+                "actual_orders"
+            ]
+
+            for row in rows
+        )
+
+
+        total_on_time = sum(
+
+            row[
+                "on_time_orders"
+            ]
+
+            for row in rows
+        )
+
+
+        total_delayed = sum(
+
+            row[
+                "delayed_orders"
+            ]
+
+            for row in rows
+        )
+
+
+        if total_actual > 0:
+
+            total_otd = round(
+
+                total_on_time
+                /
+                total_actual
+                *
+                100,
+
+                2
+            )
+
+        else:
+
+            total_otd = None
+
+
+        total_icon = (
+            otd_icon(
+                total_otd
+            )
+        )
+
+
+        if total_otd is None:
+
+            total_otd_text = (
+                "N/A"
+            )
+
+        else:
+
+            total_otd_text = (
+                f"{total_otd:.2f}%"
+            )
+
+
+        text = (
+
+            "🌙 DAILY OTD\n"
+
+            f"{today_kz().strftime('%d.%m.%Y')}\n\n"
+
+            f"📦 Orders: "
+            f"{total_morning} "
+            f"({total_actual})\n"
+
+            f"❌ Cancelled: "
+            f"{total_cancelled}\n"
+
+            f"✅ On Time: "
+            f"{total_on_time}\n"
+
+            f"🚨 Delayed: "
+            f"{total_delayed}\n"
+
+            f"📊 OTD: "
+            f"{total_icon} "
+            f"{total_otd_text}\n\n"
+
+            "🏬 BY STORE\n\n"
+        )
+
+
+        for row in sorted(
+
+            rows,
+
+            key=lambda x:
+                x[
+                    "store_name"
+                ]
+        ):
+
+
+            store_otd = (
+                row[
+                    "otd_percent"
+                ]
+            )
+
+
+            icon = (
+                otd_icon(
+                    store_otd
+                )
+            )
+
+
+            if store_otd is None:
+
+                percent_text = (
+                    "N/A"
+                )
+
+            else:
+
+                percent_text = (
+                    f"{store_otd:.2f}%"
+                )
+
+
+            text += (
+
+                f"🏬 {row['store_name']}\n"
+
+                f"Orders: "
+                f"{row['morning_orders']} "
+                f"({row['actual_orders']})\n"
+
+                f"On Time: "
+                f"{row['on_time_orders']} | "
+
+                f"Delayed: "
+                f"{row['delayed_orders']}\n"
+
+                f"OTD: "
+                f"{icon} "
+                f"{percent_text}\n"
+
+                f"Open Delays: "
+                f"{row['open_delays']}\n\n"
+            )
+
+
+        # ====================================================
+        # OPEN DELAY AGE
+        # ====================================================
+
+        open_orders = (
+            get_open_delays()
+        )
+
+
+        today_count = 0
+
+        one_day = 0
+
+        two_days = 0
+
+        three_plus = 0
+
+
+        current_time = (
+            now_kz()
+        )
+
+
+        for order in open_orders:
+
+            planned_date = (
+                order.get(
+                    "planned_transmission_date"
+                )
+            )
+
+
+            if not planned_date:
+
+                continue
+
+
+            if planned_date.tzinfo is None:
+
+                planned_date = (
+                    planned_date.replace(
+                        tzinfo=KZ_TZ
+                    )
+                )
+
+
+            planned_local = (
+                planned_date.astimezone(
+                    KZ_TZ
+                )
+            )
+
+
+            days = (
+
+                current_time.date()
+                -
+                planned_local.date()
+
+            ).days
+
+
+            if days <= 0:
+
+                today_count += 1
+
+
+            elif days == 1:
+
+                one_day += 1
+
+
+            elif days == 2:
+
+                two_days += 1
+
+
+            else:
+
+                three_plus += 1
+
+
+        text += (
+
+            "⏳ OPEN DELAYS\n\n"
+
+            f"Today: "
+            f"{today_count}\n"
+
+            f"1 Day: "
+            f"{one_day}\n"
+
+            f"2 Days: "
+            f"{two_days}\n"
+
+            f"3+ Days: "
+            f"{three_plus}\n"
+
+            f"Total Open: "
+            f"{len(open_orders)}"
+        )
+
+
+        send_long_message(
+            message.chat.id,
+            text
+        )
+
+
+    except Exception as e:
+
+        logging.exception(
+            "Daily OTD failed"
+        )
+
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
+
+
+# ============================================================
+# HISTORY COMMAND
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "history"
+    ]
+)
+def history_command(
+    message
+):
+
+    try:
+
+        rows = (
+            get_otd_history(
+                7
+            )
+        )
+
+
+        if not rows:
+
+            bot.send_message(
+                message.chat.id,
+                "📅 История OTD пока пустая."
+            )
+
+            return
+
+
+        text = (
+            "📅 OTD HISTORY\n\n"
+        )
+
+
+        for row in rows:
+
+            value = (
+                row[
+                    "otd_percent"
+                ]
+            )
+
+
+            icon = (
+                otd_icon(
+                    value
+                )
+            )
+
+
+            if value is None:
+
+                value_text = (
+                    "N/A"
+                )
+
+            else:
+
+                value_text = (
+
+                    f"{float(value):.2f}%"
+                )
+
+
+            report_date = (
+                row[
+                    "report_date"
+                ]
+            )
+
+
+            text += (
+
+                f"📅 "
+                f"{report_date.strftime('%d.%m.%Y')}\n"
+
+                f"Orders: "
+                f"{row['morning_orders']} "
+                f"({row['actual_orders']})\n"
+
+                f"On Time: "
+                f"{row['on_time_orders']} | "
+
+                f"Delayed: "
+                f"{row['delayed_orders']}\n"
+
+                f"OTD: "
+                f"{icon} "
+                f"{value_text}\n\n"
+            )
+
+
+        send_long_message(
+            message.chat.id,
+            text
+        )
+
+
+    except Exception as e:
+
+        logging.exception(
+            "History command failed"
+        )
+
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
+
+
+# ============================================================
+# AUTOMATIC JOBS
+# ============================================================
+
+def automatic_morning_job():
+
+    try:
+
+        logging.info(
+            "Starting automatic Morning Snapshot"
+        )
+
+
+        orders = (
+            create_morning_snapshot()
+        )
+
+
+        logging.info(
+            "Automatic Morning Snapshot "
+            f"completed | orders={len(orders)}"
+        )
+
+
+    except Exception:
+
+        logging.exception(
+            "Automatic Morning Snapshot failed"
+        )
+
+
+def automatic_evening_job():
+
+    try:
+
+        logging.info(
+            "Starting automatic Daily OTD"
+        )
+
+
+        rows = (
+            finalize_daily_otd()
+        )
+
+
+        logging.info(
+            "Automatic Daily OTD completed | "
+            f"stores={len(rows)}"
+        )
+
+
+    except Exception:
+
+        logging.exception(
+            "Automatic Daily OTD failed"
+        )
+
+
+# ============================================================
+# SCHEDULER WITHOUT schedule LIBRARY
+# ============================================================
+
+last_morning_run = None
+
+last_evening_run = None
+
+
+def scheduler_loop():
+
+    global last_morning_run
+
+    global last_evening_run
+
+
+    logging.info(
+        "Scheduler started | "
+        f"Morning={MORNING_REPORT_TIME} | "
+        f"Evening={EVENING_REPORT_TIME} | "
+        "Timezone=UTC+5"
+    )
+
+
+    while True:
+
+        try:
+
+            current_time = (
+                now_kz()
+            )
+
+
+            current_hm = (
+                current_time.strftime(
+                    "%H:%M"
+                )
+            )
+
+
+            current_date = (
+                current_time.date()
+            )
+
+
+            # =================================================
+            # MORNING
+            # =================================================
+
+            if (
+
+                current_hm
+                ==
+                MORNING_REPORT_TIME
+
+                and
+
+                last_morning_run
+                !=
+                current_date
+
+            ):
+
+                last_morning_run = (
+                    current_date
+                )
+
+
+                threading.Thread(
+
+                    target=
+                        automatic_morning_job,
+
+                    daemon=True
+
+                ).start()
+
+
+            # =================================================
+            # EVENING
+            # =================================================
+
+            if (
+
+                current_hm
+                ==
+                EVENING_REPORT_TIME
+
+                and
+
+                last_evening_run
+                !=
+                current_date
+
+            ):
+
+                last_evening_run = (
+                    current_date
+                )
+
+
+                threading.Thread(
+
+                    target=
+                        automatic_evening_job,
+
+                    daemon=True
+
+                ).start()
+
+
+            time.sleep(
+                20
+            )
+
+
+        except Exception:
+
+            logging.exception(
+                "Scheduler loop error"
+            )
+
+
+            time.sleep(
+                30
+            )
+
+
+# ============================================================
+# FLASK HOME
+# ============================================================
+
+@app.route(
+    "/",
+    methods=[
+        "GET"
+    ]
+)
+def home():
+
+    return (
+        "OMS KZ Bot is running",
+        200
+    )
+
+
+# ============================================================
+# TELEGRAM WEBHOOK
+# ============================================================
+
+@app.route(
+    "/" + TELEGRAM_API_KEY,
+    methods=[
+        "POST"
+    ]
+)
+def telegram_webhook():
+
+    try:
+
+        json_string = (
+
+            request
+            .get_data()
+            .decode(
+                "utf-8"
+            )
+        )
+
+
+        update = (
+
+            telebot
+            .types
+            .Update
+            .de_json(
+                json_string
+            )
+        )
+
+
+        bot.process_new_updates(
+            [
+                update
+            ]
+        )
+
+
+        return (
+            "OK",
+            200
+        )
+
+
+    except Exception:
+
+        logging.exception(
+            "Telegram webhook error"
+        )
+
+
+        return (
+            "ERROR",
+            500
+        )
+
+
+# ============================================================
+# START APPLICATION
+# ============================================================
+
+if __name__ == "__main__":
+
+    # ========================================================
+    # DATABASE CHECK
+    # ========================================================
+
+    db_success, db_message = (
+        test_connection()
+    )
+
+
+    if db_success:
+
+        logging.info(
+            "✅ Supabase connected successfully"
+        )
+
+
+    else:
+
+        logging.error(
+            "❌ Supabase connection failed | "
+            f"{db_message}"
+        )
+
+
+    # ========================================================
+    # START SCHEDULER
+    # ========================================================
+
+    scheduler_thread = (
+        threading.Thread(
+
+            target=
+                scheduler_loop,
+
+            daemon=True
+        )
+    )
+
+
+    scheduler_thread.start()
+
+
+    # ========================================================
+    # TELEGRAM WEBHOOK
+    # ========================================================
 
     try:
 
         bot.remove_webhook()
 
+
+        time.sleep(
+            1
+        )
+
+
+        clean_webhook_url = (
+            WEBHOOK_URL.rstrip(
+                "/"
+            )
+        )
+
+
+        telegram_webhook_url = (
+
+            f"{clean_webhook_url}/"
+
+            f"{TELEGRAM_API_KEY}"
+        )
+
+
         bot.set_webhook(
-            url=(
-                f"https://nbot-n94j.onrender.com/"
-                f"{API_KEY}"
-            )
+            url=
+                telegram_webhook_url
         )
 
-        port = int(
-            os.environ.get(
-                'PORT',
-                5000
-            )
+
+        logging.info(
+            "Telegram webhook installed successfully"
         )
 
-        app.run(
-            host='0.0.0.0',
-            port=port
+
+    except Exception:
+
+        logging.exception(
+            "Telegram webhook setup failed"
         )
 
-    except Exception as e:
 
-        logging.error(
-            f"Main loop error: {e}"
+    # ========================================================
+    # RENDER PORT
+    # ========================================================
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
         )
+    )
+
+
+    logging.info(
+        f"Starting Flask on port {port}"
+    )
+
+
+    app.run(
+
+        host=
+            "0.0.0.0",
+
+        port=
+            port
+    )
