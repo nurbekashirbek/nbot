@@ -400,39 +400,96 @@ def parse_kaspi_order(raw_order, current_time=None):
 
 def fetch_accepted_orders(lookback_days=None):
     """
-    Fetch accepted Kaspi Delivery orders once, page by page.
-    Filtering and DB writing happen in bulk afterward.
+    Fetch ACCEPTED_BY_MERCHANT / KASPI_DELIVERY orders.
+
+    IMPORTANT:
+    Kaspi API allows a maximum creationDate search interval of 14 days.
+    Therefore a longer sync period (for example 30 days) is automatically
+    split into safe date windows and merged in memory.
+
+    Orders are de-duplicated by order code.
     """
     lookback_days = lookback_days or SYNC_LOOKBACK_DAYS
+
     end_dt = now_kz()
     start_dt = end_dt - timedelta(days=lookback_days)
 
-    result = []
-    page = 0
-    page_size = 100
-    started = time.perf_counter()
+    # Keep each request window comfortably below the documented 14-day maximum.
+    # 13 days avoids boundary/rounding issues.
+    max_window = timedelta(days=13)
 
-    while True:
-        params = {
-            "page[number]": page,
-            "page[size]": page_size,
-            "filter[orders][creationDate][$ge]": int(start_dt.timestamp() * 1000),
-            "filter[orders][creationDate][$le]": int(end_dt.timestamp() * 1000),
-            "filter[orders][status]": "ACCEPTED_BY_MERCHANT",
-            "filter[orders][state]": "KASPI_DELIVERY",
-        }
-        data = kaspi_get(params)
-        rows = data.get("data") or []
-        result.extend(rows)
-        if len(rows) < page_size:
-            break
-        page += 1
+    result_by_code = {}
+    window_start = start_dt
+    started = time.perf_counter()
+    window_no = 0
+
+    while window_start < end_dt:
+        window_no += 1
+        window_end = min(window_start + max_window, end_dt)
+
+        page = 0
+        page_size = 100
+
+        logging.info(
+            "Kaspi sync window %s | %s -> %s",
+            window_no,
+            window_start.strftime("%Y-%m-%d %H:%M"),
+            window_end.strftime("%Y-%m-%d %H:%M"),
+        )
+
+        while True:
+            params = {
+                "page[number]": page,
+                "page[size]": page_size,
+                "filter[orders][creationDate][$ge]": int(
+                    window_start.timestamp() * 1000
+                ),
+                "filter[orders][creationDate][$le]": int(
+                    window_end.timestamp() * 1000
+                ),
+                "filter[orders][status]": "ACCEPTED_BY_MERCHANT",
+                "filter[orders][state]": "KASPI_DELIVERY",
+            }
+
+            data = kaspi_get(params)
+            rows = data.get("data") or []
+
+            for row in rows:
+                attrs = row.get("attributes") or {}
+                code = str(attrs.get("code") or "").strip()
+
+                # Code is the stable business identifier.
+                # Fallback to API entity id only if code is unexpectedly absent.
+                key = code or str(row.get("id") or "")
+                if key:
+                    result_by_code[key] = row
+
+            logging.info(
+                "Kaspi sync window %s | page=%s | received=%s | unique_total=%s",
+                window_no,
+                page,
+                len(rows),
+                len(result_by_code),
+            )
+
+            if len(rows) < page_size:
+                break
+
+            page += 1
+
+        # The next window starts 1 millisecond after the previous one,
+        # so the same boundary timestamp is not requested twice.
+        window_start = window_end + timedelta(milliseconds=1)
+
+    result = list(result_by_code.values())
 
     logging.info(
-        "Accepted Kaspi orders fetched | %s | %.2fs",
+        "Accepted Kaspi orders fetched | %s unique orders | windows=%s | %.2fs",
         len(result),
+        window_no,
         time.perf_counter() - started,
     )
+
     return result
 
 
