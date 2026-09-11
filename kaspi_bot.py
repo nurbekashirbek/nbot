@@ -1671,7 +1671,7 @@ def send_email(subject, html_body, attachment_paths=None):
 
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = formataddr(("OMS KZ Reports", EMAIL_FROM))
+    msg["From"] = formataddr(("Nurbek ASHIRBEK", EMAIL_FROM))
     msg["To"] = ", ".join(to_list)
     if cc_list:
         msg["Cc"] = ", ".join(cc_list)
@@ -1769,6 +1769,7 @@ def morning_email_html(report_date):
 </p>
 
 <p>
+    Best regards, <br>
     <span style="color: #FF5733; font-weight: bold; font-size: 22px;">Nurbek ASHIRBEK</span><br>
     <span style="color: #000000;">E-commerce specialist</span>
 </p>
@@ -1845,6 +1846,7 @@ def daily_email_html(report_date):
 </p>
 
 <p>
+    Best regards, <br>
     <span style="color: #FF5733; font-weight: bold; font-size: 22px;">Nurbek ASHIRBEK</span><br>
     <span style="color: #000000;">E-commerce specialist</span>
 </p>
