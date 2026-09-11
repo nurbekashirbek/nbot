@@ -1,739 +1,2199 @@
 import os
+import time
 import logging
-from contextlib import contextmanager
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta, timezone
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import requests
+import telebot
+from flask import Flask, request
+from telebot.types import BotCommand
+
+from database import (
+    test_connection,
+    get_table_counts,
+    upsert_order,
+    get_order_by_code,
+    save_status_history,
+    mark_order_morning_snapshot,
+    save_daily_snapshot,
+    get_snapshot_orders,
+    get_open_delays,
+    save_daily_otd,
+    get_daily_otd,
+    get_otd_history
+)
 
 
 # ============================================================
-# CONNECTION
+# CONFIG
 # ============================================================
 
-def get_connection():
-    database_url = os.getenv("DATABASE_URL")
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    )
+)
 
-    if not database_url:
-        raise ValueError("DATABASE_URL is not set")
+API_KEY = os.getenv("TELEGRAM_API_KEY")
+KASPI_AUTH_TOKEN = os.getenv("KASPI_AUTH_TOKEN")
 
-    return psycopg2.connect(
-        database_url,
-        sslmode="require",
-        connect_timeout=15
+if not API_KEY:
+    raise ValueError(
+        "TELEGRAM_API_KEY is not set"
+    )
+
+if not KASPI_AUTH_TOKEN:
+    raise ValueError(
+        "KASPI_AUTH_TOKEN is not set"
     )
 
 
-@contextmanager
-def db_connection():
-    connection = None
+bot = telebot.TeleBot(API_KEY)
 
-    try:
-        connection = get_connection()
-        yield connection
-        connection.commit()
+app = Flask(__name__)
 
-    except Exception:
-        if connection:
-            connection.rollback()
-        raise
 
-    finally:
-        if connection:
-            connection.close()
+KASPI_URL = (
+    "https://kaspi.kz/shop/api/v2/orders"
+)
+
+KZ_TZ = timezone(
+    timedelta(hours=5)
+)
+
+
+# Можно менять потом через Render Environment
+MORNING_REPORT_TIME = os.getenv(
+    "MORNING_REPORT_TIME",
+    "09:00"
+)
+
+EVENING_REPORT_TIME = os.getenv(
+    "EVENING_REPORT_TIME",
+    "20:00"
+)
 
 
 # ============================================================
-# TEST
+# STORES
 # ============================================================
 
-def test_connection():
-    connection = None
+STORE_MAPPING = {
+    "14576033_9005": "Karaganda Tair",
+    "14576033_9020": "Almaty Mart",
+    "14576033_9003": "Almaty Aport",
+    "14576033_9080": "Astana InStreet",
+    "14576033_9078": "Aktobe InStreet",
+    "14576033_9077": "Almaty InStreet",
+    "14576033_9004": "Shym Bayan Sulu",
+    "14576033_9104": "Astana Reebok",
+    "14576033_9006": "Astana Asia Park",
+    "14576033_9101": "Aktobe Reebok",
+    "14576033_9041": "Almaty Warehouse"
+}
+
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
+
+commands = [
+    BotCommand(
+        "db_test",
+        "Проверить базу данных"
+    ),
+
+    BotCommand(
+        "morning",
+        "Сохранить Morning Snapshot"
+    ),
+
+    BotCommand(
+        "daily_otd",
+        "Рассчитать OTD сегодня"
+    ),
+
+    BotCommand(
+        "pending_orders",
+        "Заказы на передачу сегодня"
+    ),
+
+    BotCommand(
+        "orders",
+        "Открытые задержки"
+    ),
+
+    BotCommand(
+        "open_delays",
+        "Текущие открытые задержки"
+    ),
+
+    BotCommand(
+        "history",
+        "История OTD за 7 дней"
+    )
+]
+
+bot.set_my_commands(commands)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_kz():
+    return datetime.now(KZ_TZ)
+
+
+def today_kz():
+    return now_kz().date()
+
+
+def timestamp_to_datetime(value):
+    if not value:
+        return None
 
     try:
-        connection = get_connection()
-
-        with connection.cursor(
-            cursor_factory=RealDictCursor
-        ) as cursor:
-            cursor.execute(
-                "SELECT NOW() AS server_time;"
-            )
-
-            result = cursor.fetchone()
-
-        logging.info(
-            "Database connected. "
-            f"Server time: {result['server_time']}"
+        return datetime.fromtimestamp(
+            int(value) / 1000,
+            tz=KZ_TZ
         )
 
-        return True, "Connection successful"
-
-    except psycopg2.OperationalError as e:
-        error = str(e)
-        logging.error(f"Database error: {error}")
-
-        lower = error.lower()
-
-        if "password authentication failed" in lower:
-            return False, "Wrong database password"
-
-        if "could not translate host name" in lower:
-            return False, "Database hostname cannot be resolved"
-
-        if "network is unreachable" in lower:
-            return False, "Database network unreachable"
-
-        if "timeout expired" in lower:
-            return False, "Database connection timeout"
-
-        return False, "PostgreSQL connection error"
-
-    except Exception as e:
-        logging.exception("Database connection error")
-        return False, str(e)
-
-    finally:
-        if connection:
-            connection.close()
-
-
-def get_table_counts():
-    try:
-        with db_connection() as connection:
-            with connection.cursor() as cursor:
-
-                result = {}
-
-                for table in [
-                    "orders",
-                    "order_status_history",
-                    "daily_order_snapshot",
-                    "daily_otd"
-                ]:
-                    cursor.execute(
-                        f"SELECT COUNT(*) FROM {table};"
-                    )
-                    result[table] = cursor.fetchone()[0]
-
-                return result
-
     except Exception:
-        logging.exception("get_table_counts failed")
         return None
 
 
-# ============================================================
-# ORDERS
-# ============================================================
+def send_long_message(
+    chat_id,
+    text
+):
+    max_length = 4000
 
-def upsert_order(order):
-    """
-    order = {
-        order_code,
-        pickup_point_id,
-        store_name,
-        creation_date,
-        planned_transmission_date,
-        actual_transmission_date,
-        current_status,
-        is_cancelled,
-        was_delayed,
-        is_currently_delayed,
-        delay_started_at,
-        delay_resolved_at,
-        delay_minutes
-    }
-    """
+    while text:
+        part = text[:max_length]
 
-    with db_connection() as connection:
-
-        with connection.cursor(
-            cursor_factory=RealDictCursor
-        ) as cursor:
-
-            cursor.execute(
-                """
-                INSERT INTO orders (
-                    order_code,
-                    pickup_point_id,
-                    store_name,
-                    creation_date,
-                    planned_transmission_date,
-                    actual_transmission_date,
-                    first_seen_at,
-                    last_seen_at,
-                    current_status,
-                    is_cancelled,
-                    cancelled_at,
-                    was_delayed,
-                    is_currently_delayed,
-                    delay_started_at,
-                    delay_resolved_at,
-                    delay_minutes,
-                    updated_at
-                )
-                VALUES (
-                    %(order_code)s,
-                    %(pickup_point_id)s,
-                    %(store_name)s,
-                    %(creation_date)s,
-                    %(planned_transmission_date)s,
-                    %(actual_transmission_date)s,
-                    NOW(),
-                    NOW(),
-                    %(current_status)s,
-                    %(is_cancelled)s,
-                    CASE
-                        WHEN %(is_cancelled)s = TRUE
-                        THEN NOW()
-                        ELSE NULL
-                    END,
-                    %(was_delayed)s,
-                    %(is_currently_delayed)s,
-                    %(delay_started_at)s,
-                    %(delay_resolved_at)s,
-                    %(delay_minutes)s,
-                    NOW()
-                )
-
-                ON CONFLICT (order_code)
-                DO UPDATE SET
-
-                    pickup_point_id =
-                        EXCLUDED.pickup_point_id,
-
-                    store_name =
-                        EXCLUDED.store_name,
-
-                    creation_date =
-                        COALESCE(
-                            EXCLUDED.creation_date,
-                            orders.creation_date
-                        ),
-
-                    planned_transmission_date =
-                        COALESCE(
-                            EXCLUDED.planned_transmission_date,
-                            orders.planned_transmission_date
-                        ),
-
-                    actual_transmission_date =
-                        COALESCE(
-                            EXCLUDED.actual_transmission_date,
-                            orders.actual_transmission_date
-                        ),
-
-                    last_seen_at = NOW(),
-
-                    current_status =
-                        EXCLUDED.current_status,
-
-                    is_cancelled =
-                        EXCLUDED.is_cancelled,
-
-                    cancelled_at =
-                        CASE
-                            WHEN EXCLUDED.is_cancelled = TRUE
-                            THEN COALESCE(
-                                orders.cancelled_at,
-                                NOW()
-                            )
-                            ELSE orders.cancelled_at
-                        END,
-
-                    was_delayed =
-                        orders.was_delayed
-                        OR EXCLUDED.was_delayed,
-
-                    is_currently_delayed =
-                        EXCLUDED.is_currently_delayed,
-
-                    delay_started_at =
-                        COALESCE(
-                            orders.delay_started_at,
-                            EXCLUDED.delay_started_at
-                        ),
-
-                    delay_resolved_at =
-                        CASE
-                            WHEN
-                                EXCLUDED.is_currently_delayed = FALSE
-                                AND
-                                (
-                                    orders.is_currently_delayed = TRUE
-                                    OR EXCLUDED.was_delayed = TRUE
-                                )
-                            THEN COALESCE(
-                                EXCLUDED.delay_resolved_at,
-                                orders.delay_resolved_at
-                            )
-                            ELSE orders.delay_resolved_at
-                        END,
-
-                    delay_minutes =
-                        GREATEST(
-                            orders.delay_minutes,
-                            EXCLUDED.delay_minutes
-                        ),
-
-                    updated_at = NOW()
-
-                RETURNING *;
-                """,
-                order
-            )
-
-            return cursor.fetchone()
-
-
-def get_order_by_code(order_code):
-    with db_connection() as connection:
-
-        with connection.cursor(
-            cursor_factory=RealDictCursor
-        ) as cursor:
-
-            cursor.execute(
-                """
-                SELECT *
-                FROM orders
-                WHERE order_code = %s;
-                """,
-                (str(order_code),)
-            )
-
-            return cursor.fetchone()
-
-
-# ============================================================
-# STATUS HISTORY
-# ============================================================
-
-def save_status_history(order_id, order):
-    try:
-        with db_connection() as connection:
-
-            with connection.cursor() as cursor:
-
-                cursor.execute(
-                    """
-                    INSERT INTO order_status_history (
-                        order_id,
-                        status,
-                        was_delayed,
-                        is_currently_delayed,
-                        is_cancelled,
-                        planned_transmission_date,
-                        actual_transmission_date,
-                        recorded_at
-                    )
-                    VALUES (
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        NOW()
-                    );
-                    """,
-                    (
-                        order_id,
-                        order.get("current_status"),
-                        order.get("was_delayed", False),
-                        order.get(
-                            "is_currently_delayed",
-                            False
-                        ),
-                        order.get(
-                            "is_cancelled",
-                            False
-                        ),
-                        order.get(
-                            "planned_transmission_date"
-                        ),
-                        order.get(
-                            "actual_transmission_date"
-                        )
-                    )
-                )
-
-    except Exception:
-        logging.exception(
-            "save_status_history failed"
+        bot.send_message(
+            chat_id,
+            part
         )
+
+        text = text[max_length:]
+
+
+def kaspi_headers():
+    return {
+        "X-Auth-Token":
+            KASPI_AUTH_TOKEN,
+
+        "Accept":
+            "application/vnd.api+json;charset=UTF-8",
+
+        "Content-Type":
+            "application/vnd.api+json",
+
+        "User-Agent":
+            "OMS-KZ-OTD-Bot/2.0"
+    }
+
+
+# ============================================================
+# KASPI REQUEST
+# ============================================================
+
+def kaspi_get(
+    params,
+    attempts=3
+):
+    last_error = None
+
+    for attempt in range(
+        1,
+        attempts + 1
+    ):
+        try:
+            response = requests.get(
+                KASPI_URL,
+                headers=kaspi_headers(),
+                params=params,
+                timeout=30
+            )
+
+            logging.info(
+                "Kaspi request | "
+                f"status={response.status_code}"
+            )
+
+            response.raise_for_status()
+
+            return response.json()
+
+        except Exception as e:
+            last_error = e
+
+            logging.error(
+                "Kaspi request failed | "
+                f"attempt={attempt} | "
+                f"{e}"
+            )
+
+            if attempt < attempts:
+                time.sleep(
+                    attempt * 2
+                )
+
+    raise last_error
+
+
+# ============================================================
+# PARSE KASPI ORDER
+# ============================================================
+
+def parse_kaspi_order(
+    raw_order,
+    current_time=None
+):
+    if current_time is None:
+        current_time = now_kz()
+
+    attributes = raw_order.get(
+        "attributes",
+        {}
+    )
+
+    code = str(
+        attributes.get(
+            "code",
+            ""
+        )
+    ).strip()
+
+    pickup_point_id = str(
+        attributes.get(
+            "pickupPointId",
+            ""
+        )
+    ).strip()
+
+    store_name = STORE_MAPPING.get(
+        pickup_point_id,
+        pickup_point_id
+        or "Unknown Store"
+    )
+
+    status = (
+        attributes.get(
+            "status"
+        )
+        or "UNKNOWN"
+    )
+
+    creation_date = (
+        timestamp_to_datetime(
+            attributes.get(
+                "creationDate"
+            )
+        )
+    )
+
+    # В документации эти поля могут идти
+    # непосредственно в attributes.
+    # Старый ответ Kaspi у некоторых продавцов
+    # также содержит kaspiDelivery.
+    kaspi_delivery = (
+        attributes.get(
+            "kaspiDelivery"
+        )
+        or {}
+    )
+
+    planned_raw = (
+        attributes.get(
+            "courierTransmissionPlanningDate"
+        )
+        or
+        kaspi_delivery.get(
+            "courierTransmissionPlanningDate"
+        )
+    )
+
+    actual_raw = (
+        attributes.get(
+            "courierTransmissionDate"
+        )
+        or
+        kaspi_delivery.get(
+            "courierTransmissionDate"
+        )
+    )
+
+    planned = timestamp_to_datetime(
+        planned_raw
+    )
+
+    actual = timestamp_to_datetime(
+        actual_raw
+    )
+
+    is_cancelled = (
+        status == "CANCELLED"
+    )
+
+    was_delayed = False
+    is_currently_delayed = False
+
+    delay_started_at = None
+    delay_resolved_at = None
+    delay_minutes = 0
+
+    # CANCELLED не должен портить OTD.
+    if not is_cancelled and planned:
+
+        if actual:
+
+            if actual > planned:
+
+                was_delayed = True
+
+                delay_started_at = (
+                    planned
+                )
+
+                delay_resolved_at = (
+                    actual
+                )
+
+                delay_minutes = max(
+                    0,
+                    int(
+                        (
+                            actual
+                            - planned
+                        ).total_seconds()
+                        / 60
+                    )
+                )
+
+        else:
+
+            if current_time > planned:
+
+                was_delayed = True
+
+                is_currently_delayed = True
+
+                delay_started_at = (
+                    planned
+                )
+
+                delay_minutes = max(
+                    0,
+                    int(
+                        (
+                            current_time
+                            - planned
+                        ).total_seconds()
+                        / 60
+                    )
+                )
+
+    return {
+        "order_code":
+            code,
+
+        "pickup_point_id":
+            pickup_point_id,
+
+        "store_name":
+            store_name,
+
+        "creation_date":
+            creation_date,
+
+        "planned_transmission_date":
+            planned,
+
+        "actual_transmission_date":
+            actual,
+
+        "current_status":
+            status,
+
+        "is_cancelled":
+            is_cancelled,
+
+        "was_delayed":
+            was_delayed,
+
+        "is_currently_delayed":
+            is_currently_delayed,
+
+        "delay_started_at":
+            delay_started_at,
+
+        "delay_resolved_at":
+            delay_resolved_at,
+
+        "delay_minutes":
+            delay_minutes
+    }
+
+
+# ============================================================
+# FETCH ACCEPTED ORDERS
+# ============================================================
+
+def fetch_accepted_orders(
+    lookback_days=14
+):
+    current = now_kz()
+
+    start = (
+        current
+        - timedelta(
+            days=lookback_days
+        )
+    )
+
+    page = 0
+    result = []
+
+    while True:
+
+        params = {
+            "page[number]":
+                page,
+
+            "page[size]":
+                100,
+
+            "filter[orders][creationDate][$ge]":
+                int(
+                    start.timestamp()
+                    * 1000
+                ),
+
+            "filter[orders][creationDate][$le]":
+                int(
+                    current.timestamp()
+                    * 1000
+                ),
+
+            "filter[orders][status]":
+                "ACCEPTED_BY_MERCHANT",
+
+            "filter[orders][state]":
+                "KASPI_DELIVERY"
+        }
+
+        data = kaspi_get(
+            params
+        )
+
+        orders = data.get(
+            "data",
+            []
+        )
+
+        result.extend(
+            orders
+        )
+
+        if len(orders) < 100:
+            break
+
+        page += 1
+
+    return result
+
+
+# ============================================================
+# FETCH ORDER BY CODE
+# ============================================================
+
+def fetch_order_by_code(
+    order_code
+):
+    data = kaspi_get(
+        {
+            "filter[orders][code]":
+                str(order_code),
+
+            "page[number]":
+                0,
+
+            "page[size]":
+                100
+        }
+    )
+
+    orders = data.get(
+        "data",
+        []
+    )
+
+    if not orders:
+        return None
+
+    # На всякий случай ищем точное совпадение.
+    for raw_order in orders:
+
+        code = str(
+            raw_order
+            .get(
+                "attributes",
+                {}
+            )
+            .get(
+                "code",
+                ""
+            )
+        )
+
+        if code == str(
+            order_code
+        ):
+            return raw_order
+
+    return orders[0]
+
+
+# ============================================================
+# SAVE ORDER
+# ============================================================
+
+def save_parsed_order(
+    parsed_order
+):
+    saved = upsert_order(
+        parsed_order
+    )
+
+    if saved:
+        save_status_history(
+            saved["id"],
+            parsed_order
+        )
+
+    return saved
 
 
 # ============================================================
 # MORNING SNAPSHOT
 # ============================================================
 
-def mark_order_morning_snapshot(
-    order_id,
-    report_date
+def create_morning_snapshot(
+    report_date=None
 ):
-    with db_connection() as connection:
+    if report_date is None:
+        report_date = today_kz()
 
-        with connection.cursor() as cursor:
+    current = now_kz()
 
-            cursor.execute(
-                """
-                UPDATE orders
-                SET
-                    morning_snapshot_date = %s,
-                    was_in_morning_snapshot = TRUE,
-                    updated_at = NOW()
-                WHERE id = %s;
-                """,
-                (
-                    report_date,
-                    order_id
-                )
+    raw_orders = (
+        fetch_accepted_orders()
+    )
+
+    today_orders = []
+
+    for raw in raw_orders:
+
+        parsed = parse_kaspi_order(
+            raw,
+            current
+        )
+
+        planned = parsed.get(
+            "planned_transmission_date"
+        )
+
+        if not planned:
+            continue
+
+        # Главное правило:
+        # ориентируемся исключительно на
+        # courierTransmissionPlanningDate.
+        #
+        # Для 9041 никаких специальных
+        # исключений больше нет.
+        if planned.date() != report_date:
+            continue
+
+        saved = save_parsed_order(
+            parsed
+        )
+
+        if not saved:
+            continue
+
+        mark_order_morning_snapshot(
+            saved["id"],
+            report_date
+        )
+
+        parsed[
+            "was_on_time"
+        ] = False
+
+        parsed[
+            "snapshot_delayed"
+        ] = False
+
+        save_daily_snapshot(
+            report_date,
+            saved["id"],
+            parsed
+        )
+
+        today_orders.append(
+            parsed
+        )
+
+    logging.info(
+        "Morning snapshot created | "
+        f"date={report_date} | "
+        f"orders={len(today_orders)}"
+    )
+
+    return today_orders
+
+
+# ============================================================
+# REFRESH ONE ORDER
+# ============================================================
+
+def refresh_order(
+    order_code
+):
+    raw = fetch_order_by_code(
+        order_code
+    )
+
+    if not raw:
+        logging.warning(
+            "Order not found in Kaspi | "
+            f"{order_code}"
+        )
+
+        # ВАЖНО:
+        # отсутствие заказа НЕ считаем отменой.
+        return None
+
+    parsed = parse_kaspi_order(
+        raw
+    )
+
+    saved = save_parsed_order(
+        parsed
+    )
+
+    return parsed, saved
+
+
+# ============================================================
+# REFRESH ALL OPEN DELAYS
+# ============================================================
+
+def refresh_open_delays():
+    open_orders = (
+        get_open_delays()
+    )
+
+    refreshed = 0
+
+    for order in open_orders:
+
+        try:
+            result = refresh_order(
+                order["order_code"]
             )
 
+            if result:
+                refreshed += 1
 
-def save_daily_snapshot(
-    report_date,
-    order_id,
-    order
+            # Не атакуем Kaspi множеством запросов.
+            time.sleep(0.15)
+
+        except Exception:
+            logging.exception(
+                "Open delay refresh failed | "
+                f"{order['order_code']}"
+            )
+
+    logging.info(
+        "Open delays refreshed | "
+        f"{refreshed}"
+    )
+
+    return refreshed
+
+
+# ============================================================
+# FINALIZE DAILY OTD
+# ============================================================
+
+def finalize_daily_otd(
+    report_date=None
 ):
-    with db_connection() as connection:
+    if report_date is None:
+        report_date = today_kz()
 
-        with connection.cursor() as cursor:
+    snapshots = (
+        get_snapshot_orders(
+            report_date
+        )
+    )
 
-            cursor.execute(
-                """
-                INSERT INTO daily_order_snapshot (
-                    report_date,
-                    order_id,
-                    order_code,
-                    store_name,
-                    pickup_point_id,
-                    planned_transmission_date,
-                    actual_transmission_date,
-                    final_status,
-                    was_present_morning,
-                    was_cancelled,
-                    was_on_time,
-                    was_delayed,
-                    delay_minutes,
-                    checked_at,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    TRUE,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    NOW(),
-                    NOW(),
-                    NOW()
-                )
+    if not snapshots:
+        logging.warning(
+            "No morning snapshot exists | "
+            f"{report_date}"
+        )
 
-                ON CONFLICT (
-                    report_date,
-                    order_id
-                )
-                DO UPDATE SET
+        return []
 
-                    order_code =
-                        EXCLUDED.order_code,
+    # Сначала обновляем старые открытые задержки.
+    refresh_open_delays()
 
-                    store_name =
-                        EXCLUDED.store_name,
+    current = now_kz()
 
-                    pickup_point_id =
-                        EXCLUDED.pickup_point_id,
+    final_rows = []
 
-                    planned_transmission_date =
-                        EXCLUDED.planned_transmission_date,
+    for snapshot in snapshots:
 
-                    actual_transmission_date =
-                        EXCLUDED.actual_transmission_date,
+        order_code = str(
+            snapshot[
+                "order_code"
+            ]
+        )
 
-                    final_status =
-                        EXCLUDED.final_status,
+        try:
+            raw = fetch_order_by_code(
+                order_code
+            )
 
-                    was_cancelled =
-                        EXCLUDED.was_cancelled,
+            # Если API временно не вернул заказ —
+            # не называем его CANCELLED.
+            if raw:
 
-                    was_on_time =
-                        EXCLUDED.was_on_time,
-
-                    was_delayed =
-                        EXCLUDED.was_delayed,
-
-                    delay_minutes =
-                        EXCLUDED.delay_minutes,
-
-                    checked_at = NOW(),
-
-                    updated_at = NOW();
-                """,
-                (
-                    report_date,
-                    order_id,
-                    str(order["order_code"]),
-                    order["store_name"],
-                    order["pickup_point_id"],
-                    order.get(
-                        "planned_transmission_date"
-                    ),
-                    order.get(
-                        "actual_transmission_date"
-                    ),
-                    order.get(
-                        "current_status"
-                    ),
-                    order.get(
-                        "is_cancelled",
-                        False
-                    ),
-                    order.get(
-                        "was_on_time",
-                        False
-                    ),
-                    order.get(
-                        "snapshot_delayed",
-                        False
-                    ),
-                    order.get(
-                        "delay_minutes",
-                        0
+                parsed = (
+                    parse_kaspi_order(
+                        raw,
+                        current
                     )
                 )
+
+                saved = (
+                    save_parsed_order(
+                        parsed
+                    )
+                )
+
+            else:
+
+                existing = (
+                    get_order_by_code(
+                        order_code
+                    )
+                )
+
+                if not existing:
+                    continue
+
+                parsed = {
+                    "order_code":
+                        order_code,
+
+                    "pickup_point_id":
+                        existing[
+                            "pickup_point_id"
+                        ],
+
+                    "store_name":
+                        existing[
+                            "store_name"
+                        ],
+
+                    "planned_transmission_date":
+                        existing[
+                            "planned_transmission_date"
+                        ],
+
+                    "actual_transmission_date":
+                        existing[
+                            "actual_transmission_date"
+                        ],
+
+                    "current_status":
+                        existing[
+                            "current_status"
+                        ],
+
+                    "is_cancelled":
+                        existing[
+                            "is_cancelled"
+                        ],
+
+                    "was_delayed":
+                        existing[
+                            "was_delayed"
+                        ],
+
+                    "is_currently_delayed":
+                        existing[
+                            "is_currently_delayed"
+                        ],
+
+                    "delay_minutes":
+                        existing[
+                            "delay_minutes"
+                        ]
+                        or 0
+                }
+
+                saved = existing
+
+            planned = (
+                parsed.get(
+                    "planned_transmission_date"
+                )
             )
 
-
-def get_snapshot_orders(report_date):
-    with db_connection() as connection:
-
-        with connection.cursor(
-            cursor_factory=RealDictCursor
-        ) as cursor:
-
-            cursor.execute(
-                """
-                SELECT
-                    s.*,
-                    o.current_status,
-                    o.is_currently_delayed,
-                    o.was_delayed
-                FROM daily_order_snapshot s
-                JOIN orders o
-                    ON o.id = s.order_id
-                WHERE s.report_date = %s
-                ORDER BY
-                    s.store_name,
-                    s.order_code;
-                """,
-                (report_date,)
+            actual = (
+                parsed.get(
+                    "actual_transmission_date"
+                )
             )
 
-            return cursor.fetchall()
+            cancelled = bool(
+                parsed.get(
+                    "is_cancelled"
+                )
+            )
+
+            on_time = False
+            delayed_for_otd = False
+            delay_minutes = 0
+
+            if not cancelled and planned:
+
+                if actual:
+
+                    if actual <= planned:
+                        on_time = True
+
+                    else:
+                        delayed_for_otd = True
+
+                        delay_minutes = max(
+                            0,
+                            int(
+                                (
+                                    actual
+                                    - planned
+                                ).total_seconds()
+                                / 60
+                            )
+                        )
+
+                else:
+
+                    # Только если deadline уже наступил.
+                    if current > planned:
+
+                        delayed_for_otd = True
+
+                        delay_minutes = max(
+                            0,
+                            int(
+                                (
+                                    current
+                                    - planned
+                                ).total_seconds()
+                                / 60
+                            )
+                        )
+
+            parsed[
+                "was_on_time"
+            ] = on_time
+
+            parsed[
+                "snapshot_delayed"
+            ] = delayed_for_otd
+
+            parsed[
+                "delay_minutes"
+            ] = delay_minutes
+
+            save_daily_snapshot(
+                report_date,
+                saved["id"],
+                parsed
+            )
+
+            final_rows.append(
+                parsed
+            )
+
+            time.sleep(
+                0.15
+            )
+
+        except Exception:
+            logging.exception(
+                "Finalization failed | "
+                f"{order_code}"
+            )
+
+    # --------------------------------------------------------
+    # AGGREGATE PER STORE
+    # --------------------------------------------------------
+
+    store_data = {}
+
+    for order in final_rows:
+
+        store = order[
+            "store_name"
+        ]
+
+        if store not in store_data:
+
+            store_data[store] = {
+                "pickup_point_id":
+                    order[
+                        "pickup_point_id"
+                    ],
+
+                "morning_orders":
+                    0,
+
+                "cancelled_orders":
+                    0,
+
+                "on_time_orders":
+                    0,
+
+                "delayed_orders":
+                    0
+            }
+
+        row = store_data[
+            store
+        ]
+
+        row[
+            "morning_orders"
+        ] += 1
+
+        if order.get(
+            "is_cancelled"
+        ):
+            row[
+                "cancelled_orders"
+            ] += 1
+
+        elif order.get(
+            "was_on_time"
+        ):
+            row[
+                "on_time_orders"
+            ] += 1
+
+        elif order.get(
+            "snapshot_delayed"
+        ):
+            row[
+                "delayed_orders"
+            ] += 1
+
+    open_delays = (
+        get_open_delays()
+    )
+
+    open_by_store = {}
+
+    for order in open_delays:
+
+        store = order[
+            "store_name"
+        ]
+
+        open_by_store[
+            store
+        ] = (
+            open_by_store.get(
+                store,
+                0
+            )
+            + 1
+        )
+
+    result = []
+
+    for store, row in (
+        store_data.items()
+    ):
+
+        morning = (
+            row[
+                "morning_orders"
+            ]
+        )
+
+        cancelled = (
+            row[
+                "cancelled_orders"
+            ]
+        )
+
+        actual_orders = max(
+            0,
+            morning
+            - cancelled
+        )
+
+        on_time = (
+            row[
+                "on_time_orders"
+            ]
+        )
+
+        delayed = (
+            row[
+                "delayed_orders"
+            ]
+        )
+
+        if actual_orders > 0:
+
+            otd = round(
+                on_time
+                / actual_orders
+                * 100,
+                2
+            )
+
+        else:
+
+            otd = None
+
+        open_count = (
+            open_by_store.get(
+                store,
+                0
+            )
+        )
+
+        save_daily_otd(
+            report_date=
+                report_date,
+
+            store_name=
+                store,
+
+            pickup_point_id=
+                row[
+                    "pickup_point_id"
+                ],
+
+            morning_orders=
+                morning,
+
+            cancelled_orders=
+                cancelled,
+
+            actual_orders=
+                actual_orders,
+
+            on_time_orders=
+                on_time,
+
+            delayed_orders=
+                delayed,
+
+            otd_percent=
+                otd,
+
+            open_delays=
+                open_count
+        )
+
+        result.append(
+            {
+                "store_name":
+                    store,
+
+                "morning_orders":
+                    morning,
+
+                "cancelled_orders":
+                    cancelled,
+
+                "actual_orders":
+                    actual_orders,
+
+                "on_time_orders":
+                    on_time,
+
+                "delayed_orders":
+                    delayed,
+
+                "otd_percent":
+                    otd,
+
+                "open_delays":
+                    open_count
+            }
+        )
+
+    return result
 
 
 # ============================================================
-# OPEN DELAYS
+# OTD COLOR
 # ============================================================
 
-def get_open_delays():
-    with db_connection() as connection:
+def otd_icon(value):
+    if value is None:
+        return "⚪"
 
-        with connection.cursor(
-            cursor_factory=RealDictCursor
-        ) as cursor:
+    value = float(value)
 
-            cursor.execute(
-                """
-                SELECT *
-                FROM orders
-                WHERE
-                    is_currently_delayed = TRUE
-                    AND is_cancelled = FALSE
-                ORDER BY
-                    planned_transmission_date,
-                    store_name,
-                    order_code;
-                """
+    if value >= 95:
+        return "🟢"
+
+    if value >= 90:
+        return "🟡"
+
+    if value >= 85:
+        return "🟠"
+
+    return "🔴"
+
+
+# ============================================================
+# DB TEST
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "db_test"
+    ]
+)
+def db_test_command(
+    message
+):
+    success, info = (
+        test_connection()
+    )
+
+    if not success:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Database connection failed\n\n"
+            f"{info}"
+        )
+
+        return
+
+    counts = (
+        get_table_counts()
+    )
+
+    bot.send_message(
+        message.chat.id,
+
+        "✅ SUPABASE CONNECTED\n\n"
+
+        f"Orders: "
+        f"{counts['orders']}\n"
+
+        f"History: "
+        f"{counts['order_status_history']}\n"
+
+        f"Snapshots: "
+        f"{counts['daily_order_snapshot']}\n"
+
+        f"Daily OTD: "
+        f"{counts['daily_otd']}"
+    )
+
+
+# ============================================================
+# MANUAL MORNING
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "morning"
+    ]
+)
+def morning_command(
+    message
+):
+    bot.send_message(
+        message.chat.id,
+        "☀️ Creating morning snapshot..."
+    )
+
+    try:
+
+        orders = (
+            create_morning_snapshot()
+        )
+
+        by_store = {}
+
+        for order in orders:
+
+            store = (
+                order[
+                    "store_name"
+                ]
             )
 
-            return cursor.fetchall()
+            by_store[
+                store
+            ] = (
+                by_store.get(
+                    store,
+                    0
+                )
+                + 1
+            )
+
+        open_delays = (
+            get_open_delays()
+        )
+
+        text = (
+            "☀️ MORNING REPORT\n"
+            f"{today_kz().strftime('%d.%m.%Y')}\n\n"
+        )
+
+        total = 0
+
+        for store in sorted(
+            by_store
+        ):
+
+            count = (
+                by_store[
+                    store
+                ]
+            )
+
+            total += count
+
+            text += (
+                f"🏬 {store}: "
+                f"{count}\n"
+            )
+
+        text += (
+            "\n"
+            f"📦 Planned Today: "
+            f"{total}\n"
+            f"🚨 Previous Open Delays: "
+            f"{len(open_delays)}"
+        )
+
+        send_long_message(
+            message.chat.id,
+            text
+        )
+
+    except Exception as e:
+
+        logging.exception(
+            "Morning command failed"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
+
+
+# ============================================================
+# PENDING TODAY WITH ORDER NUMBERS
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "pending_orders"
+    ]
+)
+def pending_orders_command(
+    message
+):
+    try:
+
+        raw_orders = (
+            fetch_accepted_orders()
+        )
+
+        current = now_kz()
+
+        grouped = {}
+
+        for raw in raw_orders:
+
+            order = (
+                parse_kaspi_order(
+                    raw,
+                    current
+                )
+            )
+
+            planned = (
+                order.get(
+                    "planned_transmission_date"
+                )
+            )
+
+            if not planned:
+                continue
+
+            if (
+                planned.date()
+                != today_kz()
+            ):
+                continue
+
+            if order.get(
+                "actual_transmission_date"
+            ):
+                continue
+
+            store = (
+                order[
+                    "store_name"
+                ]
+            )
+
+            grouped.setdefault(
+                store,
+                []
+            ).append(
+                order
+            )
+
+        if not grouped:
+
+            bot.send_message(
+                message.chat.id,
+                "✅ Нет заказов, ожидающих "
+                "передачи сегодня."
+            )
+
+            return
+
+        text = (
+            "📦 PENDING ORDERS\n"
+            f"{today_kz().strftime('%d.%m.%Y')}\n\n"
+        )
+
+        total = 0
+
+        for store in sorted(
+            grouped
+        ):
+
+            orders = (
+                grouped[
+                    store
+                ]
+            )
+
+            total += len(
+                orders
+            )
+
+            text += (
+                f"🏬 {store} "
+                f"({len(orders)})\n"
+            )
+
+            for order in orders:
+
+                text += (
+                    f"• "
+                    f"{order['order_code']}\n"
+                )
+
+            text += "\n"
+
+        text += (
+            f"Total: {total}"
+        )
+
+        send_long_message(
+            message.chat.id,
+            text
+        )
+
+    except Exception as e:
+
+        logging.exception(
+            "Pending command failed"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
+
+
+# ============================================================
+# OPEN DELAYS WITH ORDER NUMBERS
+# ============================================================
+
+def build_open_delays_text():
+    orders = (
+        get_open_delays()
+    )
+
+    if not orders:
+        return (
+            "✅ OPEN DELAYS\n\n"
+            "Нет открытых задержек."
+        )
+
+    current = now_kz()
+
+    grouped = {}
+
+    for order in orders:
+
+        store = (
+            order[
+                "store_name"
+            ]
+        )
+
+        grouped.setdefault(
+            store,
+            []
+        ).append(
+            order
+        )
+
+    text = (
+        "🚨 OPEN DELAYS\n"
+        f"{today_kz().strftime('%d.%m.%Y')}\n\n"
+    )
+
+    for store in sorted(
+        grouped
+    ):
+
+        store_orders = (
+            grouped[
+                store
+            ]
+        )
+
+        text += (
+            f"🏬 {store} "
+            f"({len(store_orders)})\n"
+        )
+
+        for order in (
+            store_orders
+        ):
+
+            planned = order[
+                "planned_transmission_date"
+            ]
+
+            if planned:
+
+                delta = (
+                    current
+                    - planned
+                )
+
+                hours = max(
+                    0,
+                    int(
+                        delta.total_seconds()
+                        // 3600
+                    )
+                )
+
+                days = (
+                    delta.days
+                )
+
+                planned_text = (
+                    planned.astimezone(
+                        KZ_TZ
+                    ).strftime(
+                        "%d.%m %H:%M"
+                    )
+                )
+
+            else:
+
+                hours = 0
+                days = 0
+                planned_text = "N/A"
+
+            if days >= 3:
+
+                age = (
+                    f"🔴 {days} days"
+                )
+
+            elif days == 2:
+
+                age = (
+                    "🟠 2 days"
+                )
+
+            elif days == 1:
+
+                age = (
+                    "🟡 1 day"
+                )
+
+            else:
+
+                age = (
+                    f"⚠️ {hours}h"
+                )
+
+            text += (
+                f"• "
+                f"{order['order_code']}\n"
+                f"  Planned: "
+                f"{planned_text}\n"
+                f"  Delay: "
+                f"{age}\n"
+            )
+
+        text += "\n"
+
+    text += (
+        f"Total Open: {len(orders)}"
+    )
+
+    return text
+
+
+@bot.message_handler(
+    commands=[
+        "orders",
+        "open_delays"
+    ]
+)
+def open_delays_command(
+    message
+):
+    try:
+
+        bot.send_message(
+            message.chat.id,
+            "🔄 Refreshing open delays..."
+        )
+
+        refresh_open_delays()
+
+        text = (
+            build_open_delays_text()
+        )
+
+        send_long_message(
+            message.chat.id,
+            text
+        )
+
+    except Exception as e:
+
+        logging.exception(
+            "Open delays command failed"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
 
 
 # ============================================================
 # DAILY OTD
 # ============================================================
 
-def save_daily_otd(
-    report_date,
-    store_name,
-    pickup_point_id,
-    morning_orders,
-    cancelled_orders,
-    actual_orders,
-    on_time_orders,
-    delayed_orders,
-    otd_percent,
-    open_delays
+@bot.message_handler(
+    commands=[
+        "daily_otd"
+    ]
+)
+def daily_otd_command(
+    message
 ):
-    with db_connection() as connection:
+    try:
 
-        with connection.cursor() as cursor:
+        bot.send_message(
+            message.chat.id,
+            "🌙 Calculating Daily OTD..."
+        )
 
-            cursor.execute(
-                """
-                INSERT INTO daily_otd (
-                    report_date,
-                    pickup_point_id,
-                    store_name,
-                    morning_orders,
-                    cancelled_orders,
-                    actual_orders,
-                    on_time_orders,
-                    delayed_orders,
-                    otd_percent,
-                    open_delays,
-                    created_at,
-                    updated_at
+        rows = finalize_daily_otd()
+
+        if not rows:
+
+            bot.send_message(
+                message.chat.id,
+
+                "⚠️ Morning snapshot "
+                "for today is empty.\n\n"
+
+                "Run /morning first."
+            )
+
+            return
+
+        total_morning = sum(
+            x[
+                "morning_orders"
+            ]
+            for x in rows
+        )
+
+        total_cancelled = sum(
+            x[
+                "cancelled_orders"
+            ]
+            for x in rows
+        )
+
+        total_actual = sum(
+            x[
+                "actual_orders"
+            ]
+            for x in rows
+        )
+
+        total_on_time = sum(
+            x[
+                "on_time_orders"
+            ]
+            for x in rows
+        )
+
+        total_delayed = sum(
+            x[
+                "delayed_orders"
+            ]
+            for x in rows
+        )
+
+        if total_actual > 0:
+
+            total_otd = round(
+                total_on_time
+                / total_actual
+                * 100,
+                2
+            )
+
+        else:
+            total_otd = None
+
+        icon = otd_icon(
+            total_otd
+        )
+
+        if total_otd is None:
+            otd_text = "N/A"
+        else:
+            otd_text = (
+                f"{total_otd:.2f}%"
+            )
+
+        text = (
+            "🌙 DAILY OTD\n"
+            f"{today_kz().strftime('%d.%m.%Y')}\n\n"
+
+            f"Orders: "
+            f"{total_morning} "
+            f"({total_actual})\n"
+
+            f"Cancelled: "
+            f"{total_cancelled}\n"
+
+            f"On Time: "
+            f"{total_on_time}\n"
+
+            f"Delayed: "
+            f"{total_delayed}\n"
+
+            f"OTD: "
+            f"{icon} "
+            f"{otd_text}\n\n"
+
+            "BY STORE\n\n"
+        )
+
+        for row in sorted(
+            rows,
+            key=lambda x:
+                x[
+                    "store_name"
+                ]
+        ):
+
+            otd = row[
+                "otd_percent"
+            ]
+
+            icon = otd_icon(
+                otd
+            )
+
+            if otd is None:
+                percent = "N/A"
+            else:
+                percent = (
+                    f"{otd:.2f}%"
                 )
-                VALUES (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    NOW(),
-                    NOW()
+
+            text += (
+                f"🏬 "
+                f"{row['store_name']}\n"
+
+                f"Orders: "
+                f"{row['morning_orders']} "
+                f"({row['actual_orders']}) | "
+
+                f"Delayed: "
+                f"{row['delayed_orders']} | "
+
+                f"{icon} "
+                f"{percent}\n\n"
+            )
+
+        open_orders = (
+            get_open_delays()
+        )
+
+        today_count = 0
+        day1 = 0
+        day2 = 0
+        day3 = 0
+
+        current = now_kz()
+
+        for order in open_orders:
+
+            planned = order[
+                "planned_transmission_date"
+            ]
+
+            if not planned:
+                continue
+
+            days = (
+                current.date()
+                - planned.astimezone(
+                    KZ_TZ
+                ).date()
+            ).days
+
+            if days <= 0:
+                today_count += 1
+
+            elif days == 1:
+                day1 += 1
+
+            elif days == 2:
+                day2 += 1
+
+            else:
+                day3 += 1
+
+        text += (
+            "⏳ OPEN DELAYS\n\n"
+
+            f"Today: "
+            f"{today_count}\n"
+
+            f"1 Day: "
+            f"{day1}\n"
+
+            f"2 Days: "
+            f"{day2}\n"
+
+            f"3+ Days: "
+            f"{day3}\n"
+
+            f"Total Open: "
+            f"{len(open_orders)}"
+        )
+
+        send_long_message(
+            message.chat.id,
+            text
+        )
+
+    except Exception as e:
+
+        logging.exception(
+            "Daily OTD command failed"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+@bot.message_handler(
+    commands=[
+        "history"
+    ]
+)
+def history_command(
+    message
+):
+    try:
+
+        rows = (
+            get_otd_history(
+                7
+            )
+        )
+
+        if not rows:
+
+            bot.send_message(
+                message.chat.id,
+                "История пока пустая."
+            )
+
+            return
+
+        text = (
+            "📅 OTD HISTORY\n\n"
+        )
+
+        for row in rows:
+
+            value = (
+                row[
+                    "otd_percent"
+                ]
+            )
+
+            icon = otd_icon(
+                value
+            )
+
+            if value is None:
+                value_text = "N/A"
+            else:
+                value_text = (
+                    f"{float(value):.2f}%"
                 )
 
-                ON CONFLICT (
-                    report_date,
-                    store_name
-                )
-                DO UPDATE SET
+            text += (
+                f"{row['report_date'].strftime('%d.%m.%Y')}\n"
 
-                    pickup_point_id =
-                        EXCLUDED.pickup_point_id,
+                f"Orders: "
+                f"{row['morning_orders']} "
+                f"({row['actual_orders']}) | "
 
-                    morning_orders =
-                        EXCLUDED.morning_orders,
+                f"Delayed: "
+                f"{row['delayed_orders']} | "
 
-                    cancelled_orders =
-                        EXCLUDED.cancelled_orders,
+                f"{icon} "
+                f"{value_text}\n\n"
+            )
 
-                    actual_orders =
-                        EXCLUDED.actual_orders,
+        send_long_message(
+            message.chat.id,
+            text
+        )
 
-                    on_time_orders =
-                        EXCLUDED.on_time_orders,
+    except Exception as e:
 
-                    delayed_orders =
-                        EXCLUDED.delayed_orders,
+        logging.exception(
+            "History command failed"
+        )
 
-                    otd_percent =
-                        EXCLUDED.otd_percent,
+        bot.send_message(
+            message.chat.id,
+            f"❌ Error: {e}"
+        )
 
-                    open_delays =
-                        EXCLUDED.open_delays,
 
-                    updated_at = NOW();
-                """,
-                (
-                    report_date,
-                    pickup_point_id,
-                    store_name,
-                    morning_orders,
-                    cancelled_orders,
-                    actual_orders,
-                    on_time_orders,
-                    delayed_orders,
-                    otd_percent,
-                    open_delays
+# ============================================================
+# AUTOMATIC SCHEDULER
+# ============================================================
+
+last_morning_run = None
+last_evening_run = None
+
+
+def automatic_morning_job():
+    try:
+        orders = (
+            create_morning_snapshot()
+        )
+
+        logging.info(
+            "Automatic morning job complete | "
+            f"orders={len(orders)}"
+        )
+
+    except Exception:
+        logging.exception(
+            "Automatic morning job failed"
+        )
+
+
+def automatic_evening_job():
+    try:
+        rows = (
+            finalize_daily_otd()
+        )
+
+        logging.info(
+            "Automatic evening OTD complete | "
+            f"stores={len(rows)}"
+        )
+
+    except Exception:
+        logging.exception(
+            "Automatic evening job failed"
+        )
+
+
+def scheduler_loop():
+    global last_morning_run
+    global last_evening_run
+
+    logging.info(
+        "Scheduler started | "
+        f"morning={MORNING_REPORT_TIME} | "
+        f"evening={EVENING_REPORT_TIME} | "
+        "timezone=UTC+5"
+    )
+
+    while True:
+
+        try:
+
+            current = now_kz()
+
+            current_time = (
+                current.strftime(
+                    "%H:%M"
                 )
             )
 
-
-def get_daily_otd(report_date):
-    with db_connection() as connection:
-
-        with connection.cursor(
-            cursor_factory=RealDictCursor
-        ) as cursor:
-
-            cursor.execute(
-                """
-                SELECT *
-                FROM daily_otd
-                WHERE report_date = %s
-                ORDER BY store_name;
-                """,
-                (report_date,)
+            date = (
+                current.date()
             )
 
-            return cursor.fetchall()
+            if (
+                current_time
+                == MORNING_REPORT_TIME
+                and
+                last_morning_run
+                != date
+            ):
 
+                last_morning_run = (
+                    date
+                )
 
-def get_otd_history(days=7):
-    with db_connection() as connection:
+                threading.Thread(
+                    target=
+                        automatic_morning_job,
+                    daemon=True
+                ).start()
 
-        with connection.cursor(
-            cursor_factory=RealDictCursor
-        ) as cursor:
+            if (
+                current_time
+                == EVENING_REPORT_TIME
+                and
+                last_evening_run
+                != date
+            ):
 
-            cursor.execute(
-                """
-                SELECT
-                    report_date,
-                    SUM(morning_orders)
-                        AS morning_orders,
-                    SUM(cancelled_orders)
-                        AS cancelled_orders,
-                    SUM(actual_orders)
-                        AS actual_orders,
-                    SUM(on_time_orders)
-                        AS on_time_orders,
-                    SUM(delayed_orders)
-                        AS delayed_orders,
+                last_evening_run = (
+                    date
+                )
 
-                    CASE
-                        WHEN SUM(actual_orders) > 0
-                        THEN ROUND(
-                            SUM(on_time_orders)::NUMERIC
-                            /
-                            SUM(actual_orders)
-                            * 100,
-                            2
-                        )
-                        ELSE NULL
-                    END AS otd_percent
+                threading.Thread(
+                    target=
+                        automatic_evening_job,
+                    daemon=True
+                ).start()
 
-                FROM daily_otd
-
-                GROUP BY report_date
-
-                ORDER BY report_date DESC
-
-                LIMIT %s;
-                """,
-                (days,)
+            time.sleep(
+                20
             )
 
-            return cursor.fetchall()
+        except Exception:
+
+            logging.exception(
+                "Scheduler loop error"
+            )
+
+            time.sleep(
+                30
+            )
+
+
+# ============================================================
+# FLASK / WEBHOOK
+# ============================================================
+
+@app.route(
+    "/",
+    methods=[
+        "GET"
+    ]
+)
+def home():
+    return (
+        "OMS KZ Bot is running",
+        200
+    )
+
+
+@app.route(
+    "/" + API_KEY,
+    methods=[
+        "POST"
+    ]
+)
+def webhook():
+    try:
+
+        json_string = (
+            request
+            .get_data()
+            .decode(
+                "utf-8"
+            )
+        )
+
+        update = (
+            telebot.types.Update
+            .de_json(
+                json_string
+            )
+        )
+
+        bot.process_new_updates(
+            [update]
+        )
+
+        return (
+            "OK",
+            200
+        )
+
+    except Exception:
+
+        logging.exception(
+            "Webhook processing failed"
+        )
+
+        return (
+            "ERROR",
+            500
+        )
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+
+    success, message = (
+        test_connection()
+    )
+
+    if success:
+        logging.info(
+            "✅ Supabase connected"
+        )
+
+    else:
+        logging.error(
+            "❌ Supabase connection failed | "
+            f"{message}"
+        )
+
+    scheduler_thread = (
+        threading.Thread(
+            target=
+                scheduler_loop,
+            daemon=True
+        )
+    )
+
+    scheduler_thread.start()
+
+    # Важно:
+    # сначала снимаем старый webhook,
+    # затем ставим новый.
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+
+        webhook_url = os.getenv(
+            "WEBHOOK_URL",
+            "https://nbot-n94j.onrender.com"
+        )
+
+        webhook_url = (
+            webhook_url.rstrip(
+                "/"
+            )
+        )
+
+        bot.set_webhook(
+            url=(
+                f"{webhook_url}/"
+                f"{API_KEY}"
+            )
+        )
+
+        logging.info(
+            "Telegram webhook installed"
+        )
+
+    except Exception:
+        logging.exception(
+            "Webhook setup failed"
+        )
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
