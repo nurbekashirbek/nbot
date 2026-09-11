@@ -1,1 +1,1 @@
-"worker: python kaspi_bot.py" 
+web: python3 kaspi_bot.py
