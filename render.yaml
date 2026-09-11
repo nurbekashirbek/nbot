@@ -3,7 +3,5 @@ services:
     name: telegram-bot
     env: python
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python kaspi_bot.py"
-    envVars:
-      - key: TELEGRAM_TOKEN
-        sync: false
+    startCommand: "python3 kaspi_bot.py"
+    healthCheckPath: /
