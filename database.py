@@ -57,8 +57,58 @@ def test_connection():
         return False, str(exc)
 
 
+def ensure_report_dispatch_table():
+    """Create persistent log used to remember successful automatic report sends."""
+    with db_connection() as (_, cur):
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS report_dispatch_log (
+                id BIGSERIAL PRIMARY KEY,
+                report_date DATE NOT NULL,
+                report_type VARCHAR(20) NOT NULL,
+                sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(report_date, report_type)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_report_dispatch_date_type
+            ON report_dispatch_log(report_date, report_type)
+            """
+        )
+
+
+def was_auto_report_sent(report_date, report_type):
+    with db_connection() as (_, cur):
+        cur.execute(
+            """
+            SELECT 1
+            FROM report_dispatch_log
+            WHERE report_date = %s
+              AND report_type = %s
+            LIMIT 1
+            """,
+            (report_date, report_type),
+        )
+        return cur.fetchone() is not None
+
+
+def mark_auto_report_sent(report_date, report_type):
+    with db_connection() as (_, cur):
+        cur.execute(
+            """
+            INSERT INTO report_dispatch_log (report_date, report_type, sent_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (report_date, report_type)
+            DO UPDATE SET sent_at = EXCLUDED.sent_at
+            """,
+            (report_date, report_type),
+        )
+
+
 def get_table_counts():
-    tables = ("orders", "order_status_history", "daily_order_snapshot", "daily_otd")
+    tables = ("orders", "order_status_history", "daily_order_snapshot", "daily_otd", "report_dispatch_log")
     out = {}
     with db_connection() as (_, cur):
         for table in tables:
@@ -690,7 +740,7 @@ def get_store_period_otd(store_name, start_date, end_date):
 
 
 def get_database_delete_all_preview():
-    """Preview all rows that will be removed by full cleanup."""
+    """Return row counts before a complete bot-data cleanup."""
     with db_connection(dict_cursor=True) as (_, cur):
         cur.execute(
             """
@@ -698,6 +748,7 @@ def get_database_delete_all_preview():
                 (SELECT COUNT(*) FROM daily_otd) AS daily_otd,
                 (SELECT COUNT(*) FROM daily_order_snapshot) AS daily_order_snapshot,
                 (SELECT COUNT(*) FROM order_status_history) AS order_status_history,
+                (SELECT COUNT(*) FROM report_dispatch_log) AS report_dispatch_log,
                 (SELECT COUNT(*) FROM orders) AS orders
             """
         )
@@ -705,7 +756,10 @@ def get_database_delete_all_preview():
 
 
 def delete_all_bot_data():
-    """Delete every row from bot tables while keeping the table schema."""
+    """
+    Delete ALL bot data but keep the Supabase table structure.
+    This intentionally includes current orders and open delays.
+    """
     preview = get_database_delete_all_preview()
     with db_connection() as (_, cur):
         cur.execute(
@@ -714,11 +768,12 @@ def delete_all_bot_data():
                 daily_otd,
                 daily_order_snapshot,
                 order_status_history,
+                report_dispatch_log,
                 orders
             RESTART IDENTITY CASCADE
             """
         )
-    return {key: int(value or 0) for key, value in preview.items()}
+    return {k: int(v or 0) for k, v in preview.items()}
 
 def get_database_cleanup_preview(start_date, end_date):
     """
@@ -800,6 +855,7 @@ def delete_data_for_period(start_date, end_date):
         "daily_otd": 0,
         "daily_order_snapshot": 0,
         "order_status_history": 0,
+        "report_dispatch_log": 0,
         "orders": 0,
     }
 
@@ -831,6 +887,15 @@ def delete_data_for_period(start_date, end_date):
             (start_date, end_date),
         )
         counts["order_status_history"] = cur.rowcount
+
+        cur.execute(
+            """
+            DELETE FROM report_dispatch_log
+             WHERE report_date BETWEEN %s AND %s
+            """,
+            (start_date, end_date),
+        )
+        counts["report_dispatch_log"] = cur.rowcount
 
         # Then remove order master rows that became fully orphaned.
         cur.execute(
