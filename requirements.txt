@@ -1,11 +1,8 @@
 requests==2.31.0
-logging==0.4.9.6
-python-telegram-bot==20.3
-schedule==1.2.0
+pyTelegramBotAPI
+Flask
+psycopg2-binary==2.9.9
 openpyxl==3.1.2
 matplotlib==3.7.1
 pandas==2.0.3
-pyTelegramBotAPI
 numpy<2.0
-Flask
-psycopg2-binary==2.9.9
