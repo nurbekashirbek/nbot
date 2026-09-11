@@ -33,6 +33,8 @@ from database import (
     get_orders_by_codes,
     get_open_delays,
     get_open_delay_codes,
+    get_operational_orders,
+    get_operational_order_codes,
     get_delayed_snapshot_orders,
     replace_daily_otd,
     get_daily_otd,
@@ -65,6 +67,7 @@ EVENING_REPORT_TIME = os.getenv("EVENING_REPORT_TIME", "20:00")
 SYNC_LOOKBACK_DAYS = int(os.getenv("SYNC_LOOKBACK_DAYS", "30"))
 KASPI_PARALLEL_WORKERS = max(1, min(int(os.getenv("KASPI_PARALLEL_WORKERS", "12")), 20))
 BACKGROUND_SYNC_MINUTES = max(5, int(os.getenv("BACKGROUND_SYNC_MINUTES", "10")))
+AUTO_REPORT_WINDOW_MINUTES = max(1, int(os.getenv("AUTO_REPORT_WINDOW_MINUTES", "15")))
 
 EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
@@ -151,9 +154,29 @@ def parse_hhmm(value):
     return int(h), int(m)
 
 
-def scheduled_time_reached(now_value, hhmm):
+def scheduled_time_window_open(now_value, hhmm, window_minutes=None):
+    """
+    True only inside the automatic report window.
+
+    Example with 09:00 and 15 minutes:
+        09:00:00 <= now < 09:15:00
+
+    This prevents a Render deploy/restart at 13:00 from sending a missed
+    morning email several hours late.
+    """
+    window_minutes = window_minutes or AUTO_REPORT_WINDOW_MINUTES
     h, m = parse_hhmm(hhmm)
-    return now_value.time() >= datetime(now_value.year, now_value.month, now_value.day, h, m, tzinfo=KZ_TZ).time()
+
+    scheduled = datetime(
+        now_value.year,
+        now_value.month,
+        now_value.day,
+        h,
+        m,
+        tzinfo=KZ_TZ,
+    )
+    end = scheduled + timedelta(minutes=window_minutes)
+    return scheduled <= now_value < end
 
 
 def otd_icon(value):
@@ -643,6 +666,71 @@ def refresh_open_delays(progress_callback=None):
     return get_open_delays()
 
 
+def operational_cutoff_end(report_date=None):
+    report_date = report_date or today_kz()
+    next_day = report_date + timedelta(days=1)
+    return datetime(
+        next_day.year,
+        next_day.month,
+        next_day.day,
+        0,
+        0,
+        tzinfo=KZ_TZ,
+    )
+
+
+def refresh_operational_orders(progress_callback=None):
+    """
+    Refresh Telegram Pending/Orders data from Kaspi before showing it.
+    """
+    sync_current_orders()
+
+    cutoff_end = operational_cutoff_end(today_kz())
+    codes = get_operational_order_codes(cutoff_end)
+
+    if not codes:
+        return []
+
+    existing = get_orders_by_codes(codes)
+    refreshed = fetch_codes_parallel(codes, progress_callback=progress_callback)
+
+    to_save = []
+    for code in codes:
+        parsed = refreshed.get(code)
+        if parsed:
+            to_save.append(parsed)
+        else:
+            row = existing.get(code)
+            if row:
+                # Missing API response is not treated as cancellation.
+                to_save.append(dict(row))
+
+    if to_save:
+        bulk_save_orders(to_save, write_history=True)
+
+    return get_operational_orders(cutoff_end)
+
+
+def split_operational_orders(orders, report_date=None):
+    report_date = report_date or today_kz()
+    pending = []
+    delayed = []
+
+    for order in orders:
+        planned = order.get("planned_transmission_date")
+        if not planned:
+            continue
+
+        local_date = planned.astimezone(KZ_TZ).date()
+
+        if order.get("is_currently_delayed") or local_date < report_date:
+            delayed.append(order)
+        elif local_date == report_date:
+            pending.append(order)
+
+    return pending, delayed
+
+
 # ============================================================
 # DAILY OTD
 # ============================================================
@@ -810,184 +898,322 @@ def summarize_rows(rows):
     return total
 
 
+def _ru_age_label(planned):
+    return {
+        "Today": "сегодня",
+        "1 Day": "1 день",
+        "2 Days": "2 дня",
+        "3+ Days": "3+ дней",
+    }.get(delay_age_label(planned), delay_age_label(planned))
+
+
+def _store_groups(orders):
+    grouped = defaultdict(list)
+    for order in orders:
+        grouped[order["store_name"]].append(order)
+    return grouped
+
+
 def morning_summary_text(report_date):
     snaps = get_snapshot_orders(report_date)
-    by_store = defaultdict(int)
-    for s in snaps:
-        by_store[s["store_name"]] += 1
-
     old_open = [
         o for o in get_open_delays()
         if o.get("planned_transmission_date")
         and o["planned_transmission_date"].astimezone(KZ_TZ).date() < report_date
     ]
 
-    text = f"☀️ MORNING REPORT\n{fmt_date(report_date)}\n\n"
-    for store in sorted(by_store):
-        text += f"🏬 {store}: {by_store[store]}\n"
-    text += (
-        f"\n📦 Planned Today: {len(snaps)}\n"
-        f"🚨 Previous Open Delays: {len(old_open)}"
+    grouped = _store_groups(snaps)
+
+    text = (
+        f"Утренний отчет\n"
+        f"Дата: {fmt_date(report_date)}\n\n"
+        f"На сегодня: {len(snaps)} заказов\n"
+        f"Старых просрочек: {len(old_open)}"
     )
-    return text
+
+    if grouped:
+        text += "\n\nПо магазинам\n"
+        for store in sorted(grouped):
+            text += f"\n{store}\n"
+            text += f"Заказов: {len(grouped[store])}\n"
+
+    return text.rstrip()
 
 
 def daily_otd_text(report_date):
     rows = get_daily_otd(report_date)
     if not rows:
-        return f"🌙 DAILY OTD\n{fmt_date(report_date)}\n\nNo data."
+        return f"Итог дня\nДата: {fmt_date(report_date)}\n\nДанных пока нет."
 
     total = summarize_rows(rows)
-    value = total["otd_percent"]
-    value_text = "N/A" if value is None else f"{float(value):.2f}%"
+    pct = total["otd_percent"]
+    pct_text = "—" if pct is None else f"{float(pct):.2f}%"
 
     text = (
-        f"🌙 DAILY OTD\n{fmt_date(report_date)}\n\n"
-        f"📦 Orders: {total['morning_orders']} ({total['actual_orders']})\n"
-        f"✅ On Time: {total['on_time_orders']}\n"
-        f"🚨 Delayed: {total['delayed_orders']}\n"
-        f"📊 OTD: {otd_icon(value)} {value_text}\n\n"
-        "🏬 BY STORE\n\n"
+        f"Итог дня\n"
+        f"Дата: {fmt_date(report_date)}\n\n"
+        f"Заказов утром: {total['morning_orders']}\n"
+        f"Учтено в OTD: {total['actual_orders']}\n"
+        f"Передано вовремя: {total['on_time_orders']}\n"
+        f"Просрочено: {total['delayed_orders']}\n"
+        f"OTD: {pct_text}\n\n"
+        f"По магазинам"
     )
+
     for r in rows:
-        pct = r["otd_percent"]
-        pct_text = "N/A" if pct is None else f"{float(pct):.2f}%"
+        spct = r["otd_percent"]
+        spct_text = "—" if spct is None else f"{float(spct):.2f}%"
         text += (
-            f"{r['store_name']}\n"
-            f"Orders: {r['morning_orders']} ({r['actual_orders']}) | "
-            f"On Time: {r['on_time_orders']} | Delayed: {r['delayed_orders']}\n"
-            f"OTD: {otd_icon(pct)} {pct_text}\n\n"
+            f"\n\n{r['store_name']}\n"
+            f"Вовремя: {r['on_time_orders']} из {r['actual_orders']}\n"
+            f"Просрочено: {r['delayed_orders']}\n"
+            f"OTD: {spct_text}"
         )
 
-    ages = defaultdict(int)
-    for o in get_open_delays():
-        ages[delay_age_label(o.get("planned_transmission_date"))] += 1
-
-    text += (
-        "⏳ OPEN DELAYS\n"
-        f"Today: {ages['Today']}\n"
-        f"1 Day: {ages['1 Day']}\n"
-        f"2 Days: {ages['2 Days']}\n"
-        f"3+ Days: {ages['3+ Days']}\n"
-        f"Total Open: {sum(ages.values())}"
-    )
-    return text
+    text += f"\n\nОткрытых просрочек сейчас: {len(get_open_delays())}"
+    return text.rstrip()
 
 
 def open_delays_text(filter_age=None):
     orders = get_open_delays()
+
     if filter_age:
-        orders = [o for o in orders if delay_age_label(o.get("planned_transmission_date")) == filter_age]
+        orders = [
+            o for o in orders
+            if delay_age_label(o.get("planned_transmission_date")) == filter_age
+        ]
 
     if not orders:
-        return "✅ OPEN DELAYS\n\nNo open delays."
+        return "Открытые просрочки\n\nПросрочек нет."
 
-    grouped = defaultdict(list)
-    for o in orders:
-        grouped[o["store_name"]].append(o)
+    grouped = _store_groups(orders)
+    text = f"Открытые просрочки\nВсего: {len(orders)}"
 
-    text = "🚨 OPEN DELAYS\n\n"
     for store in sorted(grouped):
-        text += f"🏬 {store} ({len(grouped[store])})\n"
+        text += f"\n\n{store}\n"
+        text += f"Заказов: {len(grouped[store])}\n"
+
+        # Group by planned date so the date is printed once.
+        by_date = defaultdict(list)
         for o in grouped[store]:
-            text += (
-                f"• {o['order_code']}\n"
-                f"  Planned: {fmt_dt(o.get('planned_transmission_date'))}\n"
-                f"  Delay: {delay_age_label(o.get('planned_transmission_date'))}\n"
+            planned = o.get("planned_transmission_date")
+            date_key = (
+                planned.astimezone(KZ_TZ).date()
+                if planned else None
             )
-        text += "\n"
-    text += f"📊 Total Open: {len(orders)}"
-    return text
+            by_date[date_key].append(o)
+
+        for date_key in sorted(by_date, key=lambda x: (x is None, x)):
+            date_label = fmt_date(date_key) if date_key else "Без даты"
+            text += f"\n{date_label}\n"
+            for o in by_date[date_key]:
+                planned = o.get("planned_transmission_date")
+                time_label = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
+                text += (
+                    f"{o['order_code']} | "
+                    f"{time_label} | "
+                    f"{_ru_age_label(planned)}\n"
+                )
+
+    return text.rstrip()
 
 
-def pending_orders_text(report_date):
-    snaps = get_snapshot_orders(report_date)
-    pending = [
-        s for s in snaps
-        if not s.get("actual_transmission_date")
-        and not s.get("was_cancelled")
-    ]
+def pending_orders_text(report_date, orders=None):
+    if orders is None:
+        orders = get_operational_orders(operational_cutoff_end(report_date))
+
+    pending, _ = split_operational_orders(orders, report_date)
+
     if not pending:
-        return f"📦 PENDING ORDERS\n{fmt_date(report_date)}\n\nNo pending orders."
+        return (
+            f"Ожидают передачи\n"
+            f"Дата: {fmt_date(report_date)}\n\n"
+            f"Заказов нет."
+        )
 
-    grouped = defaultdict(list)
-    for o in pending:
-        grouped[o["store_name"]].append(o)
+    grouped = _store_groups(pending)
 
-    text = f"📦 PENDING ORDERS\n{fmt_date(report_date)}\n\n"
+    text = (
+        f"Ожидают передачи\n"
+        f"Дата: {fmt_date(report_date)}\n"
+        f"Всего: {len(pending)}"
+    )
+
     for store in sorted(grouped):
-        text += f"🏬 {store} ({len(grouped[store])})\n"
+        text += f"\n\n{store}\n"
+        text += f"Заказов: {len(grouped[store])}\n"
+
+        # Same date for this report, so print only time for each order.
         for o in grouped[store]:
-            text += f"• {o['order_code']} | {fmt_dt(o.get('planned_transmission_date'))}\n"
-        text += "\n"
-    text += f"📊 Total: {len(pending)}"
-    return text
+            planned = o.get("planned_transmission_date")
+            time_label = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
+            text += f"{o['order_code']} | до {time_label}\n"
+
+    return text.rstrip()
+
+
+def all_orders_text(report_date, orders=None):
+    if orders is None:
+        orders = get_operational_orders(operational_cutoff_end(report_date))
+
+    pending, delayed = split_operational_orders(orders, report_date)
+
+    if not pending and not delayed:
+        return (
+            f"Все активные заказы\n"
+            f"Дата: {fmt_date(report_date)}\n\n"
+            f"Заказов нет."
+        )
+
+    text = (
+        f"Все активные заказы\n"
+        f"Дата: {fmt_date(report_date)}\n\n"
+        f"Ожидают передачи: {len(pending)}\n"
+        f"Открытые просрочки: {len(delayed)}\n"
+        f"Всего: {len(pending) + len(delayed)}"
+    )
+
+    if pending:
+        grouped = _store_groups(pending)
+        text += "\n\nОжидают передачи"
+
+        for store in sorted(grouped):
+            text += f"\n\n{store}\n"
+            text += f"Заказов: {len(grouped[store])}\n"
+            for o in grouped[store]:
+                planned = o.get("planned_transmission_date")
+                time_label = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
+                text += f"{o['order_code']} | до {time_label}\n"
+
+    if delayed:
+        grouped = _store_groups(delayed)
+        text += "\n\nОткрытые просрочки"
+
+        for store in sorted(grouped):
+            text += f"\n\n{store}\n"
+            text += f"Заказов: {len(grouped[store])}\n"
+
+            by_date = defaultdict(list)
+            for o in grouped[store]:
+                planned = o.get("planned_transmission_date")
+                date_key = planned.astimezone(KZ_TZ).date() if planned else None
+                by_date[date_key].append(o)
+
+            for date_key in sorted(by_date, key=lambda x: (x is None, x)):
+                date_label = fmt_date(date_key) if date_key else "Без даты"
+                text += f"\n{date_label}\n"
+                for o in by_date[date_key]:
+                    planned = o.get("planned_transmission_date")
+                    time_label = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
+                    text += (
+                        f"{o['order_code']} | "
+                        f"{time_label} | "
+                        f"{_ru_age_label(planned)}\n"
+                    )
+
+    return text.rstrip()
 
 
 def today_delays_text(report_date):
     orders = get_delayed_snapshot_orders(report_date)
+
     if not orders:
-        return f"✅ TODAY'S DELAYS\n{fmt_date(report_date)}\n\nNo delayed orders."
-    grouped = defaultdict(list)
-    for o in orders:
-        grouped[o["store_name"]].append(o)
-    text = f"🚨 TODAY'S DELAYS\n{fmt_date(report_date)}\n\n"
+        return (
+            f"Просрочки за день\n"
+            f"Дата: {fmt_date(report_date)}\n\n"
+            f"Просрочек нет."
+        )
+
+    grouped = _store_groups(orders)
+
+    text = (
+        f"Просрочки за день\n"
+        f"Дата: {fmt_date(report_date)}\n"
+        f"Всего: {len(orders)}"
+    )
+
     for store in sorted(grouped):
-        text += f"🏬 {store} ({len(grouped[store])})\n"
+        text += f"\n\n{store}\n"
+        text += f"Заказов: {len(grouped[store])}\n"
+
         for o in grouped[store]:
+            planned = o.get("planned_transmission_date")
+            actual = o.get("actual_transmission_date")
+            planned_time = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
+            actual_time = actual.astimezone(KZ_TZ).strftime("%H:%M") if actual else "—"
+            delay_min = int(o.get("delay_minutes") or 0)
             text += (
-                f"• {o['order_code']}\n"
-                f"  Planned: {fmt_dt(o.get('planned_transmission_date'))}\n"
-                f"  Actual: {fmt_dt(o.get('actual_transmission_date'))}\n"
-                f"  Delay: {int(o.get('delay_minutes') or 0)} min\n"
+                f"{o['order_code']} | "
+                f"план {planned_time} | "
+                f"факт {actual_time} | "
+                f"{delay_min} мин.\n"
             )
-        text += "\n"
-    return text
+
+    return text.rstrip()
 
 
 def history_text(start_date, end_date):
     rows = get_otd_history(start_date, end_date)
-    if not rows:
-        return f"📅 OTD HISTORY\n{fmt_date(start_date)} — {fmt_date(end_date)}\n\nNo data."
 
-    text = f"📅 OTD HISTORY\n{fmt_date(start_date)} — {fmt_date(end_date)}\n\n"
+    if not rows:
+        return (
+            f"История OTD\n"
+            f"Период: {fmt_date(start_date)} — {fmt_date(end_date)}\n\n"
+            f"Данных нет."
+        )
+
+    text = (
+        f"История OTD\n"
+        f"Период: {fmt_date(start_date)} — {fmt_date(end_date)}"
+    )
+
     for r in rows:
         pct = r["otd_percent"]
-        pct_text = "N/A" if pct is None else f"{float(pct):.2f}%"
+        pct_text = "—" if pct is None else f"{float(pct):.2f}%"
         text += (
-            f"{fmt_date(r['report_date'])}\n"
-            f"Orders: {r['morning_orders']} ({r['actual_orders']}) | "
-            f"Delayed: {r['delayed_orders']} | "
-            f"{otd_icon(pct)} {pct_text}\n\n"
+            f"\n\n{fmt_date(r['report_date'])}\n"
+            f"Вовремя: {r['on_time_orders']} из {r['actual_orders']}\n"
+            f"Просрочено: {r['delayed_orders']}\n"
+            f"OTD: {pct_text}"
         )
-    return text
+
+    return text.rstrip()
 
 
 def period_summary_text(start_date, end_date):
     rows = get_period_store_otd(start_date, end_date)
+
     if not rows:
-        return f"🗓 PERIOD REPORT\n{fmt_date(start_date)} — {fmt_date(end_date)}\n\nNo data."
+        return (
+            f"Отчет за период\n"
+            f"{fmt_date(start_date)} — {fmt_date(end_date)}\n\n"
+            f"Данных нет."
+        )
+
     total = summarize_rows(rows)
     pct = total["otd_percent"]
-    pct_text = "N/A" if pct is None else f"{float(pct):.2f}%"
+    pct_text = "—" if pct is None else f"{float(pct):.2f}%"
+
     text = (
-        f"🗓 PERIOD REPORT\n{fmt_date(start_date)} — {fmt_date(end_date)}\n\n"
-        f"Orders: {total['morning_orders']} ({total['actual_orders']})\n"
-        f"On Time: {total['on_time_orders']}\n"
-        f"Delayed: {total['delayed_orders']}\n"
-        f"OTD: {otd_icon(pct)} {pct_text}\n\n"
-        "🏬 BY STORE\n\n"
+        f"Отчет за период\n"
+        f"{fmt_date(start_date)} — {fmt_date(end_date)}\n\n"
+        f"Заказов: {total['actual_orders']}\n"
+        f"Вовремя: {total['on_time_orders']}\n"
+        f"Просрочено: {total['delayed_orders']}\n"
+        f"OTD: {pct_text}\n\n"
+        f"По магазинам"
     )
+
     for r in rows:
         spct = r["otd_percent"]
-        stext = "N/A" if spct is None else f"{float(spct):.2f}%"
+        spct_text = "—" if spct is None else f"{float(spct):.2f}%"
         text += (
-            f"{r['store_name']}: "
-            f"{r['morning_orders']} ({r['actual_orders']}) | "
-            f"Delayed {r['delayed_orders']} | "
-            f"{otd_icon(spct)} {stext}\n"
+            f"\n\n{r['store_name']}\n"
+            f"Вовремя: {r['on_time_orders']} из {r['actual_orders']}\n"
+            f"OTD: {spct_text}"
         )
-    return text
+
+    return text.rstrip()
 
 
 # ============================================================
@@ -1612,34 +1838,34 @@ def send_daily_email(report_date):
 def main_menu():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("☀️ Morning Report", callback_data="morning"),
-        InlineKeyboardButton("🌙 Daily OTD", callback_data="daily"),
-        InlineKeyboardButton("📦 Pending Orders", callback_data="pending"),
-        InlineKeyboardButton("🚨 Delayed Orders", callback_data="delayed_today"),
-        InlineKeyboardButton("⏳ Open Delays", callback_data="open"),
-        InlineKeyboardButton("📅 Daily History", callback_data="history"),
-        InlineKeyboardButton("📆 Monthly OTD", callback_data="monthly"),
-        InlineKeyboardButton("🏬 Store Report", callback_data="stores"),
-        InlineKeyboardButton("🗓 Custom Period", callback_data="custom"),
-        InlineKeyboardButton("📥 Export Excel", callback_data="export"),
+        InlineKeyboardButton("Утренний отчет", callback_data="morning"),
+        InlineKeyboardButton("Итог дня", callback_data="daily"),
+        InlineKeyboardButton("Ожидают передачи", callback_data="pending"),
+        InlineKeyboardButton("Просрочки за день", callback_data="delayed_today"),
+        InlineKeyboardButton("Открытые просрочки", callback_data="open"),
+        InlineKeyboardButton("История по дням", callback_data="history"),
+        InlineKeyboardButton("OTD за месяц", callback_data="monthly"),
+        InlineKeyboardButton("Отчет по магазину", callback_data="stores"),
+        InlineKeyboardButton("Период", callback_data="custom"),
+        InlineKeyboardButton("Экспорт Excel", callback_data="export"),
     )
     return kb
 
 
 def back_menu():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu"))
+    kb.add(InlineKeyboardButton("Back", callback_data="menu"))
     return kb
 
 
 def morning_menu():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("📦 Show Orders", callback_data="pending"),
-        InlineKeyboardButton("🚨 Old Delays", callback_data="open"),
-        InlineKeyboardButton("📥 Excel", callback_data="export_morning"),
-        InlineKeyboardButton("✉️ Email", callback_data="email_morning"),
-        InlineKeyboardButton("🔙 Back", callback_data="menu"),
+        InlineKeyboardButton("Show Orders", callback_data="pending"),
+        InlineKeyboardButton("Old Delays", callback_data="open"),
+        InlineKeyboardButton("Excel", callback_data="export_morning"),
+        InlineKeyboardButton("Отправить на почту", callback_data="email_morning"),
+        InlineKeyboardButton("Back", callback_data="menu"),
     )
     return kb
 
@@ -1647,12 +1873,12 @@ def morning_menu():
 def daily_menu():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("🚨 Today's Delays", callback_data="delayed_today"),
-        InlineKeyboardButton("⏳ Open Delays", callback_data="open"),
-        InlineKeyboardButton("🏬 By Store", callback_data="stores"),
-        InlineKeyboardButton("📥 Excel", callback_data="export_daily"),
-        InlineKeyboardButton("✉️ Email", callback_data="email_daily"),
-        InlineKeyboardButton("🔙 Back", callback_data="menu"),
+        InlineKeyboardButton("Просрочки за день", callback_data="delayed_today"),
+        InlineKeyboardButton("Открытые просрочки", callback_data="open"),
+        InlineKeyboardButton("По магазинам", callback_data="stores"),
+        InlineKeyboardButton("Excel", callback_data="export_daily"),
+        InlineKeyboardButton("Отправить на почту", callback_data="email_daily"),
+        InlineKeyboardButton("Back", callback_data="menu"),
     )
     return kb
 
@@ -1665,7 +1891,7 @@ def open_menu():
         InlineKeyboardButton("2 Days", callback_data="open_age:2 Days"),
         InlineKeyboardButton("3+ Days", callback_data="open_age:3+ Days"),
         InlineKeyboardButton("Show All Orders", callback_data="open_all"),
-        InlineKeyboardButton("🔙 Back", callback_data="menu"),
+        InlineKeyboardButton("Back", callback_data="menu"),
     )
     return kb
 
@@ -1677,7 +1903,7 @@ def history_menu():
         InlineKeyboardButton("Yesterday", callback_data="hist:yesterday"),
         InlineKeyboardButton("Last 7 Days", callback_data="hist:7"),
         InlineKeyboardButton("Select Date", callback_data="hist:select"),
-        InlineKeyboardButton("🔙 Back", callback_data="menu"),
+        InlineKeyboardButton("Back", callback_data="menu"),
     )
     return kb
 
@@ -1686,7 +1912,7 @@ def store_menu():
     kb = InlineKeyboardMarkup(row_width=1)
     for store in sorted(STORE_MAPPING.values()):
         kb.add(InlineKeyboardButton(store, callback_data=f"store:{STORE_IDS_BY_NAME[store]}"))
-    kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu"))
+    kb.add(InlineKeyboardButton("Back", callback_data="menu"))
     return kb
 
 
@@ -1695,23 +1921,23 @@ def store_menu():
 # ============================================================
 
 bot.set_my_commands([
-    BotCommand("menu", "OMS KZ Reports menu"),
-    BotCommand("morning", "Morning report"),
-    BotCommand("daily_otd", "Daily OTD"),
-    BotCommand("pending_orders", "Pending orders"),
-    BotCommand("orders", "Open delayed orders"),
-    BotCommand("open_delays", "Open delays"),
-    BotCommand("history", "Last 7 days OTD"),
-    BotCommand("monthly_otd", "Current month OTD"),
-    BotCommand("send_pending_report", "Send morning email"),
-    BotCommand("send_report", "Send Daily OTD email"),
-    BotCommand("db_test", "Database status"),
+    BotCommand("menu", "Главное меню"),
+    BotCommand("morning", "Утренний отчет"),
+    BotCommand("daily_otd", "Итог дня"),
+    BotCommand("pending_orders", "Ожидают передачи сегодня"),
+    BotCommand("orders", "Все активные заказы"),
+    BotCommand("open_delays", "Открытые просрочки"),
+    BotCommand("history", "История OTD"),
+    BotCommand("monthly_otd", "OTD за текущий месяц"),
+    BotCommand("send_pending_report", "Отправить утренний отчет на почту"),
+    BotCommand("send_report", "Отправить итог дня на почту"),
+    BotCommand("db_test", "Проверить базу данных"),
 ])
 
 
 @bot.message_handler(commands=["start", "menu", "report"])
 def cmd_menu(message):
-    bot.send_message(message.chat.id, "📊 OMS KZ REPORTS", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "OMS KZ", reply_markup=main_menu())
 
 
 @bot.message_handler(commands=["db_test"])
@@ -1735,11 +1961,11 @@ def run_morning_for_chat(chat_id):
     if not _report_lock.acquire(blocking=False):
         bot.send_message(chat_id, "⏳ Another report is already running. Please wait.")
         return
-    progress = progress_message(chat_id, "☀️ Morning Report\n\nLoading Kaspi orders...")
+    progress = progress_message(chat_id, "Формирую утренний отчет...")
     started = time.perf_counter()
     try:
         def cb(done, total):
-            update_progress(progress, f"☀️ Morning Report\n\nProcessing: {done}/{total}...")
+            update_progress(progress, f"Утренний отчет: {done}/{total}")
 
         snaps, created = create_morning_snapshot(progress_callback=cb)
         elapsed = time.perf_counter() - started
@@ -1754,7 +1980,7 @@ def run_morning_for_chat(chat_id):
             send_report_photo(
                 chat_id,
                 image_path,
-                caption=f"☀️ OMS KZ Morning Report | {fmt_date(today_kz())}",
+                caption=f"Утренний отчет | {fmt_date(today_kz())}",
             )
         finally:
             image_path.unlink(missing_ok=True)
@@ -1774,15 +2000,15 @@ def run_daily_for_chat(chat_id):
     if not _report_lock.acquire(blocking=False):
         bot.send_message(chat_id, "⏳ Another report is already running. Please wait.")
         return
-    progress = progress_message(chat_id, "🌙 Daily OTD\n\nChecking today's orders...")
+    progress = progress_message(chat_id, "Формирую итог дня...")
     started = time.perf_counter()
     try:
         if get_snapshot_count(today_kz()) == 0:
-            update_progress(progress, "⚠️ No Morning Snapshot for today.\nRun /morning first.")
+            update_progress(progress, "Нет утреннего снимка за сегодня. Сначала запустите /morning.")
             return
 
         def cb(done, total):
-            update_progress(progress, f"🌙 Daily OTD\n\nKaspi status check: {done}/{total}...")
+            update_progress(progress, f"Проверяю статусы Kaspi: {done}/{total}")
 
         rows = finalize_daily_otd(progress_callback=cb)
         elapsed = time.perf_counter() - started
@@ -1793,7 +2019,7 @@ def run_daily_for_chat(chat_id):
             send_report_photo(
                 chat_id,
                 image_path,
-                caption=f"🌙 OMS KZ Daily OTD | {fmt_date(today_kz())}",
+                caption=f"Итог дня | {fmt_date(today_kz())}",
             )
         finally:
             image_path.unlink(missing_ok=True)
@@ -1809,12 +2035,55 @@ def cmd_daily(message):
     threading.Thread(target=run_daily_for_chat, args=(message.chat.id,), daemon=True).start()
 
 
+def run_operational_for_chat(chat_id, mode="all"):
+    if not _report_lock.acquire(blocking=False):
+        bot.send_message(chat_id, "Сейчас выполняется другой отчет. Попробуйте через минуту.")
+        return
+
+    progress = progress_message(chat_id, "Обновляю заказы из Kaspi...")
+
+    try:
+        def cb(done, total):
+            if total:
+                update_progress(progress, f"Проверяю статусы: {done}/{total}")
+
+        orders = refresh_operational_orders(progress_callback=cb)
+
+        if mode == "pending":
+            result = pending_orders_text(today_kz(), orders)
+        else:
+            result = all_orders_text(today_kz(), orders)
+
+        update_progress(progress, "Данные обновлены.")
+        send_long_message(chat_id, result, reply_markup=back_menu())
+
+    except Exception as exc:
+        logging.exception("Operational orders refresh failed")
+        update_progress(progress, f"Ошибка обновления: {exc}")
+
+    finally:
+        _report_lock.release()
+
+
 @bot.message_handler(commands=["pending_orders"])
 def cmd_pending(message):
-    send_long_message(message.chat.id, pending_orders_text(today_kz()), reply_markup=back_menu())
+    threading.Thread(
+        target=run_operational_for_chat,
+        args=(message.chat.id, "pending"),
+        daemon=True,
+    ).start()
 
 
-@bot.message_handler(commands=["orders", "open_delays"])
+@bot.message_handler(commands=["orders"])
+def cmd_orders(message):
+    threading.Thread(
+        target=run_operational_for_chat,
+        args=(message.chat.id, "all"),
+        daemon=True,
+    ).start()
+
+
+@bot.message_handler(commands=["open_delays"])
 def cmd_open(message):
     send_long_message(message.chat.id, open_delays_text(), reply_markup=open_menu())
 
@@ -1837,7 +2106,7 @@ def cmd_monthly(message):
 def cmd_send_pending_email(message):
     try:
         send_morning_email(today_kz())
-        bot.send_message(message.chat.id, "✅ Morning report email sent.")
+        bot.send_message(message.chat.id, "Утренний отчет отправлен на почту.")
     except Exception as exc:
         logging.exception("Morning email failed")
         bot.send_message(message.chat.id, f"❌ Email error: {exc}")
@@ -1849,7 +2118,7 @@ def cmd_send_daily_email(message):
         if not get_daily_otd(today_kz()):
             finalize_daily_otd(today_kz())
         send_daily_email(today_kz())
-        bot.send_message(message.chat.id, "✅ Daily OTD email sent.")
+        bot.send_message(message.chat.id, "Итог дня отправлен на почту.")
     except Exception as exc:
         logging.exception("Daily email failed")
         bot.send_message(message.chat.id, f"❌ Email error: {exc}")
@@ -1880,7 +2149,7 @@ def callbacks(call):
         return
 
     if data == "menu":
-        safe_edit(call, "📊 OMS KZ REPORTS", main_menu())
+        safe_edit(call, "OMS KZ", main_menu())
         return
 
     if data == "morning":
@@ -1892,7 +2161,19 @@ def callbacks(call):
         return
 
     if data == "pending":
-        safe_edit(call, pending_orders_text(today_kz()), back_menu())
+        threading.Thread(
+            target=run_operational_for_chat,
+            args=(chat_id, "pending"),
+            daemon=True,
+        ).start()
+        return
+
+    if data == "orders_all":
+        threading.Thread(
+            target=run_operational_for_chat,
+            args=(chat_id, "all"),
+            daemon=True,
+        ).start()
         return
 
     if data == "delayed_today":
@@ -1909,7 +2190,7 @@ def callbacks(call):
         return
 
     if data == "history":
-        safe_edit(call, "📅 DAILY HISTORY", history_menu())
+        safe_edit(call, "История OTD", history_menu())
         return
 
     if data == "hist:today":
@@ -1930,7 +2211,7 @@ def callbacks(call):
 
     if data == "hist:select":
         _user_state[chat_id] = {"mode": "history_date"}
-        bot.send_message(chat_id, "Send date: YYYY-MM-DD or DD.MM.YYYY")
+        bot.send_message(chat_id, "Введите дату: YYYY-MM-DD или DD.MM.YYYY")
         return
 
     if data == "monthly":
@@ -2005,7 +2286,7 @@ def callbacks(call):
     if data == "email_morning":
         try:
             send_morning_email(today_kz())
-            bot.send_message(chat_id, "✅ Morning report email sent.")
+            bot.send_message(chat_id, "Утренний отчет отправлен на почту.")
         except Exception as exc:
             bot.send_message(chat_id, f"❌ Email error: {exc}")
         return
@@ -2013,7 +2294,7 @@ def callbacks(call):
     if data == "email_daily":
         try:
             send_daily_email(today_kz())
-            bot.send_message(chat_id, "✅ Daily OTD email sent.")
+            bot.send_message(chat_id, "Итог дня отправлен на почту.")
         except Exception as exc:
             bot.send_message(chat_id, f"❌ Email error: {exc}")
         return
@@ -2135,28 +2416,58 @@ def automatic_evening_job():
 
 def scheduler_loop():
     logging.info(
-        "Scheduler started | morning=%s | evening=%s | UTC+5",
+        "Scheduler started | morning=%s | evening=%s | window=%s min | UTC+5",
         MORNING_REPORT_TIME,
         EVENING_REPORT_TIME,
+        AUTO_REPORT_WINDOW_MINUTES,
     )
+
     while True:
         try:
             current = now_kz()
             d = current.date()
 
-            # Robust after-restart behavior:
-            # if Render restarts after the exact scheduled minute, it still runs once.
-            if scheduled_time_reached(current, MORNING_REPORT_TIME):
+            # MORNING:
+            # - only inside the configured time window
+            # - only once in this process
+            # - do not recreate/resend after a restart if today's snapshot exists
+            if scheduled_time_window_open(current, MORNING_REPORT_TIME):
                 if _scheduler_state["morning"] != d:
-                    _scheduler_state["morning"] = d
-                    threading.Thread(target=automatic_morning_job, daemon=True).start()
+                    if get_snapshot_count(d) == 0:
+                        _scheduler_state["morning"] = d
+                        threading.Thread(
+                            target=automatic_morning_job,
+                            daemon=True,
+                        ).start()
+                    else:
+                        _scheduler_state["morning"] = d
+                        logging.info(
+                            "Automatic morning skipped | snapshot already exists for %s",
+                            d,
+                        )
 
-            if scheduled_time_reached(current, EVENING_REPORT_TIME):
+            # EVENING:
+            # - only inside the configured time window
+            # - only once in this process
+            # - do not resend after a restart if Daily OTD is already stored
+            if scheduled_time_window_open(current, EVENING_REPORT_TIME):
                 if _scheduler_state["evening"] != d:
-                    _scheduler_state["evening"] = d
-                    threading.Thread(target=automatic_evening_job, daemon=True).start()
+                    existing_daily = get_daily_otd(d)
+                    if not existing_daily:
+                        _scheduler_state["evening"] = d
+                        threading.Thread(
+                            target=automatic_evening_job,
+                            daemon=True,
+                        ).start()
+                    else:
+                        _scheduler_state["evening"] = d
+                        logging.info(
+                            "Automatic evening skipped | Daily OTD already exists for %s",
+                            d,
+                        )
 
             time.sleep(30)
+
         except Exception:
             logging.exception("Scheduler loop error")
             time.sleep(30)
