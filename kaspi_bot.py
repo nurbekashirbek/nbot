@@ -42,6 +42,10 @@ from database import (
     get_period_store_otd,
     get_store_period_otd,
     get_period_snapshots,
+    get_database_cleanup_preview,
+    delete_data_for_period,
+    get_database_delete_all_preview,
+    delete_all_bot_data,
 )
 
 
@@ -104,6 +108,30 @@ STORE_MAPPING = {
     "14576033_9101": "Aktobe Reebok",
     "14576033_9041": "Almaty Warehouse",
 }
+
+
+def store_code_from_pickup_id(pickup_point_id):
+    if not pickup_point_id:
+        return "—"
+    value = str(pickup_point_id)
+    if "_" in value:
+        value = value.rsplit("_", 1)[-1]
+    return value[-4:] if len(value) >= 4 else value
+
+
+STORE_CODE_BY_NAME = {
+    name: store_code_from_pickup_id(pickup_id)
+    for pickup_id, name in STORE_MAPPING.items()
+}
+
+
+def store_label(store_name, pickup_point_id=None):
+    code = (
+        store_code_from_pickup_id(pickup_point_id)
+        if pickup_point_id
+        else STORE_CODE_BY_NAME.get(store_name, "—")
+    )
+    return f"{code} {store_name}" if code != "—" else store_name
 STORE_IDS_BY_NAME = {v: k for k, v in STORE_MAPPING.items()}
 
 _user_state = {}
@@ -984,39 +1012,35 @@ def open_delays_text(filter_age=None):
         ]
 
     if not orders:
-        return "Открытые просрочки\n\nПросрочек нет."
+        return "📊 Статистика по задержанным заказам:\n\nЗадержанных заказов нет."
 
-    grouped = _store_groups(orders)
-    text = f"Открытые просрочки\nВсего: {len(orders)}"
+    grouped = defaultdict(list)
+    for o in orders:
+        grouped[o["store_name"]].append(o)
+
+    lines = ["📊 Статистика по задержанным заказам:", ""]
 
     for store in sorted(grouped):
-        text += f"\n\n{store}\n"
-        text += f"Заказов: {len(grouped[store])}\n"
+        lines.append(
+            f"{STORE_CODE_BY_NAME.get(store, '—')} {store}: "
+            f"{len(grouped[store])} заказов"
+        )
 
-        # Group by planned date so the date is printed once.
-        by_date = defaultdict(list)
-        for o in grouped[store]:
-            planned = o.get("planned_transmission_date")
-            date_key = (
-                planned.astimezone(KZ_TZ).date()
-                if planned else None
-            )
-            by_date[date_key].append(o)
+    lines.extend([
+        "",
+        f"✅ Итого: {len(orders)} заказов",
+        "",
+        "📦 Задержанные заказы по магазинам:",
+    ])
 
-        for date_key in sorted(by_date, key=lambda x: (x is None, x)):
-            date_label = fmt_date(date_key) if date_key else "Без даты"
-            text += f"\n{date_label}\n"
-            for o in by_date[date_key]:
-                planned = o.get("planned_transmission_date")
-                time_label = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
-                text += (
-                    f"{o['order_code']} | "
-                    f"{time_label} | "
-                    f"{_ru_age_label(planned)}\n"
-                )
+    for store in sorted(grouped):
+        lines.append(
+            f"Магазин {STORE_CODE_BY_NAME.get(store, '—')} {store}:"
+        )
+        for order in grouped[store]:
+            lines.append(f"🔸 Номер заказа: {order['order_code']}")
 
-    return text.rstrip()
-
+    return "\n".join(lines)
 
 def pending_orders_text(report_date, orders=None):
     if orders is None:
@@ -1025,132 +1049,113 @@ def pending_orders_text(report_date, orders=None):
     pending, _ = split_operational_orders(orders, report_date)
 
     if not pending:
-        return (
-            f"Ожидают передачи\n"
-            f"Дата: {fmt_date(report_date)}\n\n"
-            f"Заказов нет."
-        )
+        return "📊 Статистика по заказам, ожидающим передачи:\n\nЗаказов нет."
 
-    grouped = _store_groups(pending)
+    grouped = defaultdict(list)
+    for o in pending:
+        grouped[o["store_name"]].append(o)
 
-    text = (
-        f"Ожидают передачи\n"
-        f"Дата: {fmt_date(report_date)}\n"
-        f"Всего: {len(pending)}"
-    )
+    lines = ["📊 Статистика по заказам, ожидающим передачи:", ""]
 
     for store in sorted(grouped):
-        text += f"\n\n{store}\n"
-        text += f"Заказов: {len(grouped[store])}\n"
+        lines.append(
+            f"{STORE_CODE_BY_NAME.get(store, '—')} {store}: "
+            f"{len(grouped[store])} заказов"
+        )
 
-        # Same date for this report, so print only time for each order.
-        for o in grouped[store]:
-            planned = o.get("planned_transmission_date")
-            time_label = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
-            text += f"{o['order_code']} | до {time_label}\n"
+    lines.extend([
+        "",
+        f"✅ Итого: {len(pending)} заказов",
+        "",
+        "📦 Заказы по магазинам:",
+    ])
 
-    return text.rstrip()
+    for store in sorted(grouped):
+        lines.append(
+            f"Магазин {STORE_CODE_BY_NAME.get(store, '—')} {store}:"
+        )
+        for order in grouped[store]:
+            lines.append(f"🔸 Номер заказа: {order['order_code']}")
 
+    return "\n".join(lines)
 
 def all_orders_text(report_date, orders=None):
     if orders is None:
         orders = get_operational_orders(operational_cutoff_end(report_date))
 
     pending, delayed = split_operational_orders(orders, report_date)
+    active = pending + delayed
 
-    if not pending and not delayed:
-        return (
-            f"Все активные заказы\n"
-            f"Дата: {fmt_date(report_date)}\n\n"
-            f"Заказов нет."
+    if not active:
+        return "📊 Статистика по активным заказам:\n\nЗаказов нет."
+
+    grouped = defaultdict(list)
+    for o in active:
+        grouped[o["store_name"]].append(o)
+
+    lines = [
+        "📊 Статистика по активным заказам:",
+        "",
+        f"Ожидают передачи: {len(pending)} заказов",
+        f"Задержанные: {len(delayed)} заказов",
+        "",
+    ]
+
+    for store in sorted(grouped):
+        lines.append(
+            f"{STORE_CODE_BY_NAME.get(store, '—')} {store}: "
+            f"{len(grouped[store])} заказов"
         )
 
-    text = (
-        f"Все активные заказы\n"
-        f"Дата: {fmt_date(report_date)}\n\n"
-        f"Ожидают передачи: {len(pending)}\n"
-        f"Открытые просрочки: {len(delayed)}\n"
-        f"Всего: {len(pending) + len(delayed)}"
-    )
+    lines.extend([
+        "",
+        f"✅ Итого: {len(active)} заказов",
+        "",
+        "📦 Активные заказы по магазинам:",
+    ])
 
-    if pending:
-        grouped = _store_groups(pending)
-        text += "\n\nОжидают передачи"
+    for store in sorted(grouped):
+        lines.append(
+            f"Магазин {STORE_CODE_BY_NAME.get(store, '—')} {store}:"
+        )
+        for order in grouped[store]:
+            lines.append(f"🔸 Номер заказа: {order['order_code']}")
 
-        for store in sorted(grouped):
-            text += f"\n\n{store}\n"
-            text += f"Заказов: {len(grouped[store])}\n"
-            for o in grouped[store]:
-                planned = o.get("planned_transmission_date")
-                time_label = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
-                text += f"{o['order_code']} | до {time_label}\n"
-
-    if delayed:
-        grouped = _store_groups(delayed)
-        text += "\n\nОткрытые просрочки"
-
-        for store in sorted(grouped):
-            text += f"\n\n{store}\n"
-            text += f"Заказов: {len(grouped[store])}\n"
-
-            by_date = defaultdict(list)
-            for o in grouped[store]:
-                planned = o.get("planned_transmission_date")
-                date_key = planned.astimezone(KZ_TZ).date() if planned else None
-                by_date[date_key].append(o)
-
-            for date_key in sorted(by_date, key=lambda x: (x is None, x)):
-                date_label = fmt_date(date_key) if date_key else "Без даты"
-                text += f"\n{date_label}\n"
-                for o in by_date[date_key]:
-                    planned = o.get("planned_transmission_date")
-                    time_label = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
-                    text += (
-                        f"{o['order_code']} | "
-                        f"{time_label} | "
-                        f"{_ru_age_label(planned)}\n"
-                    )
-
-    return text.rstrip()
-
+    return "\n".join(lines)
 
 def today_delays_text(report_date):
     orders = get_delayed_snapshot_orders(report_date)
 
     if not orders:
-        return (
-            f"Просрочки за день\n"
-            f"Дата: {fmt_date(report_date)}\n\n"
-            f"Просрочек нет."
-        )
+        return "📊 Статистика по просроченным заказам за день:\n\nПросрочек нет."
 
-    grouped = _store_groups(orders)
+    grouped = defaultdict(list)
+    for o in orders:
+        grouped[o["store_name"]].append(o)
 
-    text = (
-        f"Просрочки за день\n"
-        f"Дата: {fmt_date(report_date)}\n"
-        f"Всего: {len(orders)}"
-    )
+    lines = ["📊 Статистика по просроченным заказам за день:", ""]
 
     for store in sorted(grouped):
-        text += f"\n\n{store}\n"
-        text += f"Заказов: {len(grouped[store])}\n"
+        lines.append(
+            f"{STORE_CODE_BY_NAME.get(store, '—')} {store}: "
+            f"{len(grouped[store])} заказов"
+        )
 
-        for o in grouped[store]:
-            planned = o.get("planned_transmission_date")
-            actual = o.get("actual_transmission_date")
-            planned_time = planned.astimezone(KZ_TZ).strftime("%H:%M") if planned else "—"
-            actual_time = actual.astimezone(KZ_TZ).strftime("%H:%M") if actual else "—"
-            delay_min = int(o.get("delay_minutes") or 0)
-            text += (
-                f"{o['order_code']} | "
-                f"план {planned_time} | "
-                f"факт {actual_time} | "
-                f"{delay_min} мин.\n"
-            )
+    lines.extend([
+        "",
+        f"✅ Итого: {len(orders)} заказов",
+        "",
+        "📦 Просроченные заказы по магазинам:",
+    ])
 
-    return text.rstrip()
+    for store in sorted(grouped):
+        lines.append(
+            f"Магазин {STORE_CODE_BY_NAME.get(store, '—')} {store}:"
+        )
+        for order in grouped[store]:
+            lines.append(f"🔸 Номер заказа: {order['order_code']}")
 
+    return "\n".join(lines)
 
 def history_text(start_date, end_date):
     rows = get_otd_history(start_date, end_date)
@@ -1254,12 +1259,13 @@ def build_morning_excel(report_date):
     ws = wb.active
     ws.title = "Morning Orders"
     ws.append([
-        "Order Code", "Store", "Pickup Point", "Planned Transmission",
+        "Order Code", "Store Code", "Store", "Pickup Point", "Planned Transmission",
         "Actual Transmission", "Status"
     ])
     for s in snaps:
         ws.append([
             s["order_code"],
+            STORE_CODE_BY_NAME.get(s["store_name"], store_code_from_pickup_id(s.get("pickup_point_id"))),
             s["store_name"],
             s["pickup_point_id"],
             fmt_dt(s.get("planned_transmission_date")),
@@ -1270,13 +1276,14 @@ def build_morning_excel(report_date):
 
     old = wb.create_sheet("Previous Open Delays")
     old.append([
-        "Order Code", "Store", "Pickup Point", "Planned Transmission",
+        "Order Code", "Store Code", "Store", "Pickup Point", "Planned Transmission",
         "Delay Age", "Current Status"
     ])
     for o in open_orders:
         if o.get("planned_transmission_date") and o["planned_transmission_date"].astimezone(KZ_TZ).date() < report_date:
             old.append([
                 o["order_code"],
+                STORE_CODE_BY_NAME.get(o["store_name"], store_code_from_pickup_id(o.get("pickup_point_id"))),
                 o["store_name"],
                 o["pickup_point_id"],
                 fmt_dt(o.get("planned_transmission_date")),
@@ -1286,7 +1293,7 @@ def build_morning_excel(report_date):
     style_sheet(old)
 
     summary = wb.create_sheet("Summary", 0)
-    summary.append(["Store", "Planned Today", "Previous Open Delays"])
+    summary.append(["Store Code", "Store", "Planned Today", "Previous Open Delays"])
     today_by_store = defaultdict(int)
     old_by_store = defaultdict(int)
     for s in snaps:
@@ -1296,8 +1303,8 @@ def build_morning_excel(report_date):
             old_by_store[o["store_name"]] += 1
     stores = sorted(set(today_by_store) | set(old_by_store))
     for store in stores:
-        summary.append([store, today_by_store[store], old_by_store[store]])
-    summary.append(["TOTAL", sum(today_by_store.values()), sum(old_by_store.values())])
+        summary.append([STORE_CODE_BY_NAME.get(store, "—"), store, today_by_store[store], old_by_store[store]])
+    summary.append(["", "TOTAL", sum(today_by_store.values()), sum(old_by_store.values())])
     style_sheet(summary)
 
     path = Path(tempfile.gettempdir()) / f"Morning_Orders_{report_date.isoformat()}.xlsx"
@@ -1315,11 +1322,12 @@ def build_daily_excel(report_date):
     summary = wb.active
     summary.title = "Summary"
     summary.append([
-        "Store", "Morning Orders", "Cancelled", "Actual", "On Time",
+        "Store Code", "Store", "Morning Orders", "Cancelled", "Actual", "On Time",
         "Delayed", "OTD %", "Open Delays"
     ])
     for r in rows:
         summary.append([
+            STORE_CODE_BY_NAME.get(r["store_name"], "—"),
             r["store_name"],
             r["morning_orders"],
             r["cancelled_orders"],
@@ -1331,6 +1339,7 @@ def build_daily_excel(report_date):
         ])
     total = summarize_rows(rows)
     summary.append([
+        "",
         "TOTAL",
         total["morning_orders"],
         total["cancelled_orders"],
@@ -1342,19 +1351,21 @@ def build_daily_excel(report_date):
     ])
     style_sheet(summary)
     for row in range(2, summary.max_row + 1):
-        cell = summary.cell(row=row, column=7)
+        cell = summary.cell(row=row, column=8)
         cell.fill = PatternFill("solid", fgColor=otd_fill(cell.value))
         if cell.value is not None:
             cell.number_format = '0.00"%"'
 
     todays = wb.create_sheet("Today's Orders")
     todays.append([
-        "Order Code", "Store", "Pickup Point", "Planned", "Actual",
+        "Order Code", "Store Code", "Store", "Pickup Point", "Planned", "Actual",
         "Final Status", "Cancelled", "On Time", "Delayed", "Delay Minutes"
     ])
     for s in snaps:
         todays.append([
-            s["order_code"], s["store_name"], s["pickup_point_id"],
+            s["order_code"],
+            STORE_CODE_BY_NAME.get(s["store_name"], store_code_from_pickup_id(s.get("pickup_point_id"))),
+            s["store_name"], s["pickup_point_id"],
             fmt_dt(s.get("planned_transmission_date")),
             fmt_dt(s.get("actual_transmission_date")),
             s.get("final_status"),
@@ -1367,11 +1378,11 @@ def build_daily_excel(report_date):
 
     dws = wb.create_sheet("Delayed Orders")
     dws.append([
-        "Order Code", "Store", "Planned", "Actual", "Delay Minutes", "Status"
+        "Order Code", "Store Code", "Store", "Planned", "Actual", "Delay Minutes", "Status"
     ])
     for s in delayed:
         dws.append([
-            s["order_code"], s["store_name"],
+            s["order_code"], STORE_CODE_BY_NAME.get(s["store_name"], "—"), s["store_name"],
             fmt_dt(s.get("planned_transmission_date")),
             fmt_dt(s.get("actual_transmission_date")),
             int(s.get("delay_minutes") or 0),
@@ -1381,11 +1392,11 @@ def build_daily_excel(report_date):
 
     ows = wb.create_sheet("Open Delays")
     ows.append([
-        "Order Code", "Store", "Planned", "Delay Age", "Delay Minutes", "Current Status"
+        "Order Code", "Store Code", "Store", "Planned", "Delay Age", "Delay Minutes", "Current Status"
     ])
     for o in open_orders:
         ows.append([
-            o["order_code"], o["store_name"],
+            o["order_code"], STORE_CODE_BY_NAME.get(o["store_name"], "—"), o["store_name"],
             fmt_dt(o.get("planned_transmission_date")),
             delay_age_label(o.get("planned_transmission_date")),
             int(o.get("delay_minutes") or 0),
@@ -1407,18 +1418,19 @@ def build_period_excel(start_date, end_date):
     ws = wb.active
     ws.title = "By Store"
     ws.append([
-        "Store", "Morning Orders", "Cancelled", "Actual",
+        "Store Code", "Store", "Morning Orders", "Cancelled", "Actual",
         "On Time", "Delayed", "OTD %"
     ])
     for r in store_rows:
         ws.append([
-            r["store_name"], r["morning_orders"], r["cancelled_orders"],
+            STORE_CODE_BY_NAME.get(r["store_name"], "—"), r["store_name"],
+            r["morning_orders"], r["cancelled_orders"],
             r["actual_orders"], r["on_time_orders"], r["delayed_orders"],
             float(r["otd_percent"]) if r["otd_percent"] is not None else None,
         ])
     style_sheet(ws)
     for row in range(2, ws.max_row + 1):
-        cell = ws.cell(row=row, column=7)
+        cell = ws.cell(row=row, column=8)
         cell.fill = PatternFill("solid", fgColor=otd_fill(cell.value))
         if cell.value is not None:
             cell.number_format = '0.00"%"'
@@ -1441,12 +1453,13 @@ def build_period_excel(start_date, end_date):
 
     ows = wb.create_sheet("Orders")
     ows.append([
-        "Date", "Order Code", "Store", "Planned", "Actual",
+        "Date", "Order Code", "Store Code", "Store", "Planned", "Actual",
         "Cancelled", "On Time", "Delayed", "Delay Minutes"
     ])
     for s in snaps:
         ows.append([
-            fmt_date(s["report_date"]), s["order_code"], s["store_name"],
+            fmt_date(s["report_date"]), s["order_code"],
+            STORE_CODE_BY_NAME.get(s["store_name"], "—"), s["store_name"],
             fmt_dt(s.get("planned_transmission_date")),
             fmt_dt(s.get("actual_transmission_date")),
             "Yes" if s.get("was_cancelled") else "No",
@@ -1568,10 +1581,11 @@ def build_morning_table_image(report_date):
 
     stores = sorted(set(planned) | set(previous))
     rows = [
-        [store, planned[store], previous[store]]
+        [STORE_CODE_BY_NAME.get(store, "—"), store, planned[store], previous[store]]
         for store in stores
     ]
     rows.append([
+        "",
         "TOTAL",
         sum(planned.values()),
         sum(previous.values()),
@@ -1580,7 +1594,7 @@ def build_morning_table_image(report_date):
     return _draw_table_image(
         "OMS KZ — Morning Report",
         fmt_date(report_date),
-        ["Store", "Planned Today", "Previous Open Delays"],
+        ["Store Code", "Store", "Planned Today", "Previous Open Delays"],
         rows,
         f"Morning_Report_{report_date.isoformat()}.png",
     )
@@ -1595,6 +1609,7 @@ def build_daily_table_image(report_date):
         pct = r["otd_percent"]
         pct_text = "N/A" if pct is None else f"{float(pct):.2f}%"
         rows.append([
+            STORE_CODE_BY_NAME.get(r["store_name"], "—"),
             r["store_name"],
             f"{r['morning_orders']} ({r['actual_orders']})",
             r["on_time_orders"],
@@ -1604,6 +1619,7 @@ def build_daily_table_image(report_date):
 
     total_pct = total["otd_percent"]
     rows.append([
+        "",
         "TOTAL",
         f"{total['morning_orders']} ({total['actual_orders']})",
         total["on_time_orders"],
@@ -1614,10 +1630,10 @@ def build_daily_table_image(report_date):
     return _draw_table_image(
         "OMS KZ — Daily OTD",
         fmt_date(report_date),
-        ["Store", "Orders", "On Time", "Delayed", "OTD"],
+        ["Store Code", "Store", "Orders", "On Time", "Delayed", "OTD"],
         rows,
         f"Daily_OTD_{report_date.isoformat()}.png",
-        otd_column=4,
+        otd_column=5,
     )
 
 
@@ -1715,17 +1731,19 @@ def morning_email_html(report_date):
 
     stores = sorted(set(planned) | set(previous))
     rows = [[
+        (STORE_CODE_BY_NAME.get(store, "—"), None),
         (store, None),
         (planned[store], None),
         (previous[store], None),
     ] for store in stores]
     rows.append([
+        ("", "#D9EAF7"),
         ("TOTAL", "#D9EAF7"),
         (sum(planned.values()), "#D9EAF7"),
         (sum(previous.values()), "#D9EAF7"),
     ])
 
-    table = html_table(["Store", "Planned Today", "Previous Open Delays"], rows)
+    table = html_table(["Store Code", "Store", "Planned Today", "Previous Open Delays"], rows)
     return f"""
     <div style="font-family:Arial;color:#1f1f1f">
       <p>Hello colleagues,<br>Добрый день, коллеги!</p>
@@ -1749,6 +1767,7 @@ def daily_email_html(report_date):
         pct_text = "N/A" if pct is None else f"{float(pct):.2f}%"
         bg = f"#{otd_fill(pct)}"
         table_rows.append([
+            (STORE_CODE_BY_NAME.get(r["store_name"], "—"), None),
             (r["store_name"], None),
             (f"{r['morning_orders']} ({r['actual_orders']})", None),
             (r["on_time_orders"], None),
@@ -1759,6 +1778,7 @@ def daily_email_html(report_date):
     total_pct = total["otd_percent"]
     total_pct_text = "N/A" if total_pct is None else f"{float(total_pct):.2f}%"
     table_rows.append([
+        ("", "#D9EAF7"),
         ("TOTAL", "#D9EAF7"),
         (f"{total['morning_orders']} ({total['actual_orders']})", "#D9EAF7"),
         (total["on_time_orders"], "#D9EAF7"),
@@ -1766,7 +1786,7 @@ def daily_email_html(report_date):
         (total_pct_text, f"#{otd_fill(total_pct)}"),
     ])
 
-    main_table = html_table(["Store", "Orders", "On Time", "Delayed", "OTD"], table_rows)
+    main_table = html_table(["Store Code", "Store", "Orders", "On Time", "Delayed", "OTD"], table_rows)
 
     ages = defaultdict(int)
     for o in get_open_delays():
@@ -1849,23 +1869,24 @@ def main_menu():
         InlineKeyboardButton("Период", callback_data="custom"),
         InlineKeyboardButton("Экспорт Excel", callback_data="export"),
     )
+    kb.add(InlineKeyboardButton("Удалить старые данные", callback_data="db_cleanup"))
     return kb
 
 
 def back_menu():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Back", callback_data="menu"))
+    kb.add(InlineKeyboardButton("Назад", callback_data="menu"))
     return kb
 
 
 def morning_menu():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("Show Orders", callback_data="pending"),
-        InlineKeyboardButton("Old Delays", callback_data="open"),
+        InlineKeyboardButton("Показать заказы", callback_data="pending"),
+        InlineKeyboardButton("Старые просрочки", callback_data="open"),
         InlineKeyboardButton("Excel", callback_data="export_morning"),
         InlineKeyboardButton("Отправить на почту", callback_data="email_morning"),
-        InlineKeyboardButton("Back", callback_data="menu"),
+        InlineKeyboardButton("Назад", callback_data="menu"),
     )
     return kb
 
@@ -1878,7 +1899,7 @@ def daily_menu():
         InlineKeyboardButton("По магазинам", callback_data="stores"),
         InlineKeyboardButton("Excel", callback_data="export_daily"),
         InlineKeyboardButton("Отправить на почту", callback_data="email_daily"),
-        InlineKeyboardButton("Back", callback_data="menu"),
+        InlineKeyboardButton("Назад", callback_data="menu"),
     )
     return kb
 
@@ -1891,7 +1912,7 @@ def open_menu():
         InlineKeyboardButton("2 Days", callback_data="open_age:2 Days"),
         InlineKeyboardButton("3+ Days", callback_data="open_age:3+ Days"),
         InlineKeyboardButton("Show All Orders", callback_data="open_all"),
-        InlineKeyboardButton("Back", callback_data="menu"),
+        InlineKeyboardButton("Назад", callback_data="menu"),
     )
     return kb
 
@@ -1903,7 +1924,7 @@ def history_menu():
         InlineKeyboardButton("Yesterday", callback_data="hist:yesterday"),
         InlineKeyboardButton("Last 7 Days", callback_data="hist:7"),
         InlineKeyboardButton("Select Date", callback_data="hist:select"),
-        InlineKeyboardButton("Back", callback_data="menu"),
+        InlineKeyboardButton("Назад", callback_data="menu"),
     )
     return kb
 
@@ -1912,7 +1933,41 @@ def store_menu():
     kb = InlineKeyboardMarkup(row_width=1)
     for store in sorted(STORE_MAPPING.values()):
         kb.add(InlineKeyboardButton(store, callback_data=f"store:{STORE_IDS_BY_NAME[store]}"))
-    kb.add(InlineKeyboardButton("Back", callback_data="menu"))
+    kb.add(InlineKeyboardButton("Назад", callback_data="menu"))
+    return kb
+
+
+def db_cleanup_menu():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("Старше 30 дней", callback_data="dbclean:30"),
+        InlineKeyboardButton("Старше 60 дней", callback_data="dbclean:60"),
+        InlineKeyboardButton("Старше 90 дней", callback_data="dbclean:90"),
+        InlineKeyboardButton("Выбрать период", callback_data="dbclean:custom"),
+        InlineKeyboardButton("Удалить все данные", callback_data="dbclean:all"),
+        InlineKeyboardButton("Назад", callback_data="menu"),
+    )
+    return kb
+
+
+def db_cleanup_confirm_menu(start_date, end_date):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(
+            "Подтвердить удаление",
+            callback_data=f"dbclean_confirm:{start_date.isoformat()}:{end_date.isoformat()}",
+        ),
+        InlineKeyboardButton("Отмена", callback_data="db_cleanup"),
+    )
+    return kb
+
+
+def db_cleanup_all_confirm_menu():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("Да, удалить ВСЕ данные", callback_data="dbclean_all_confirm"),
+        InlineKeyboardButton("Отмена", callback_data="db_cleanup"),
+    )
     return kb
 
 
@@ -2148,6 +2203,104 @@ def callbacks(call):
             bot.send_message(chat_id, f"❌ Export error: {exc}")
         return
 
+    if data == "db_cleanup":
+        safe_edit(
+            call,
+            "Удаление старых данных из Supabase\n\n"
+            "Можно удалить историю за выбранный период. "
+            "Текущие открытые просрочки и незавершенные заказы защищены.",
+            db_cleanup_menu(),
+        )
+        return
+
+    if data.startswith("dbclean:"):
+        option = data.split(":", 1)[1]
+
+        if option == "custom":
+            _user_state[chat_id] = {"mode": "db_cleanup_period"}
+            bot.send_message(
+                chat_id,
+                "Введите период для удаления:\n"
+                "DD.MM.YYYY DD.MM.YYYY\n\n"
+                "Пример: 01.01.2026 30.06.2026"
+            )
+            return
+
+        if option == "all":
+            preview = get_database_delete_all_preview()
+            total_rows = sum(int(v or 0) for v in preview.values())
+            safe_edit(
+                call,
+                "ВНИМАНИЕ: удалить ВСЕ данные из базы бота?\n\n"
+                f"Daily OTD: {preview.get('daily_otd', 0)}\n"
+                f"Снимки заказов: {preview.get('daily_order_snapshot', 0)}\n"
+                f"История статусов: {preview.get('order_status_history', 0)}\n"
+                f"Заказы: {preview.get('orders', 0)}\n\n"
+                f"Всего строк: {total_rows}\n\n"
+                "Будут удалены также текущие заказы и открытые просрочки. "
+                "Таблицы Supabase останутся. После следующей синхронизации "
+                "актуальные заказы снова загрузятся из Kaspi.",
+                db_cleanup_all_confirm_menu(),
+            )
+            return
+
+        days = int(option)
+        end_date = today_kz() - timedelta(days=days)
+        start_date = date(2000, 1, 1)
+
+        preview = get_database_cleanup_preview(start_date, end_date)
+        total_rows = sum(int(v or 0) for v in preview.values())
+
+        safe_edit(
+            call,
+            f"Удалить данные до {fmt_date(end_date)} включительно?\n\n"
+            f"Daily OTD: {preview.get('daily_otd', 0)}\n"
+            f"Снимки заказов: {preview.get('daily_order_snapshot', 0)}\n"
+            f"История статусов: {preview.get('order_status_history', 0)}\n"
+            f"Старые завершенные заказы: {preview.get('orders', 0)}\n\n"
+            f"Всего строк: {total_rows}\n\n"
+            "Открытые просрочки и незавершенные заказы не удаляются.",
+            db_cleanup_confirm_menu(start_date, end_date),
+        )
+        return
+
+    if data == "dbclean_all_confirm":
+        counts = delete_all_bot_data()
+        total_rows = sum(int(v or 0) for v in counts.values())
+        safe_edit(
+            call,
+            "Все данные базы бота удалены.\n\n"
+            f"Daily OTD: {counts.get('daily_otd', 0)}\n"
+            f"Снимки заказов: {counts.get('daily_order_snapshot', 0)}\n"
+            f"История статусов: {counts.get('order_status_history', 0)}\n"
+            f"Заказы: {counts.get('orders', 0)}\n\n"
+            f"Удалено строк: {total_rows}\n\n"
+            "Структура таблиц Supabase сохранена.",
+            back_menu(),
+        )
+        return
+
+    if data.startswith("dbclean_confirm:"):
+        _, start_text, end_text = data.split(":", 2)
+        start_date = date.fromisoformat(start_text)
+        end_date = date.fromisoformat(end_text)
+
+        counts = delete_data_for_period(start_date, end_date)
+        total_rows = sum(int(v or 0) for v in counts.values())
+
+        safe_edit(
+            call,
+            f"Удаление завершено.\n\n"
+            f"Период: {fmt_date(start_date)} — {fmt_date(end_date)}\n"
+            f"Daily OTD: {counts.get('daily_otd', 0)}\n"
+            f"Снимки заказов: {counts.get('daily_order_snapshot', 0)}\n"
+            f"История статусов: {counts.get('order_status_history', 0)}\n"
+            f"Старые завершенные заказы: {counts.get('orders', 0)}\n\n"
+            f"Удалено строк: {total_rows}",
+            back_menu(),
+        )
+        return
+
     if data == "menu":
         safe_edit(call, "OMS KZ", main_menu())
         return
@@ -2314,6 +2467,43 @@ def state_input(message):
             d = parse_date_text(message.text)
             _user_state.pop(message.chat.id, None)
             send_long_message(message.chat.id, history_text(d, d), reply_markup=history_menu())
+            return
+
+        if mode == "db_cleanup_period":
+            parts = message.text.replace("—", " ").replace("–", " ").split()
+            if len(parts) != 2:
+                raise ValueError("Укажите ровно две даты")
+
+            start = parse_date_text(parts[0])
+            end = parse_date_text(parts[1])
+
+            if start > end:
+                start, end = end, start
+
+            # Never allow deleting today/future data through this menu.
+            latest_allowed = today_kz() - timedelta(days=1)
+            if end > latest_allowed:
+                end = latest_allowed
+
+            if start > end:
+                raise ValueError("Нельзя удалять сегодняшний или будущий день")
+
+            preview = get_database_cleanup_preview(start, end)
+            total_rows = sum(int(v or 0) for v in preview.values())
+
+            _user_state.pop(message.chat.id, None)
+
+            bot.send_message(
+                message.chat.id,
+                f"Удалить данные за период {fmt_date(start)} — {fmt_date(end)}?\n\n"
+                f"Daily OTD: {preview.get('daily_otd', 0)}\n"
+                f"Снимки заказов: {preview.get('daily_order_snapshot', 0)}\n"
+                f"История статусов: {preview.get('order_status_history', 0)}\n"
+                f"Старые завершенные заказы: {preview.get('orders', 0)}\n\n"
+                f"Всего строк: {total_rows}\n\n"
+                "Открытые просрочки и незавершенные заказы не удаляются.",
+                reply_markup=db_cleanup_confirm_menu(start, end),
+            )
             return
 
         if mode == "custom_period":
