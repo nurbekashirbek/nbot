@@ -20,6 +20,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from PIL import Image, ImageDraw, ImageFont
 
 from database import (
     test_connection,
@@ -63,6 +64,7 @@ MORNING_REPORT_TIME = os.getenv("MORNING_REPORT_TIME", "09:00")
 EVENING_REPORT_TIME = os.getenv("EVENING_REPORT_TIME", "20:00")
 SYNC_LOOKBACK_DAYS = int(os.getenv("SYNC_LOOKBACK_DAYS", "30"))
 KASPI_PARALLEL_WORKERS = max(1, min(int(os.getenv("KASPI_PARALLEL_WORKERS", "12")), 20))
+BACKGROUND_SYNC_MINUTES = max(5, int(os.getenv("BACKGROUND_SYNC_MINUTES", "10")))
 
 EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
@@ -305,6 +307,19 @@ def ts_to_dt(value):
 
 
 def parse_kaspi_order(raw_order, current_time=None):
+    """
+    Parse a Kaspi order.
+
+    Primary deadline:
+        courierTransmissionPlanningDate
+
+    Fallback ONLY for discovering old/current open delays when Kaspi does not
+    return courierTransmissionPlanningDate:
+        plannedDeliveryDate
+
+    The Morning OTD snapshot still uses the real courier planning date only.
+    This prevents delivery date from silently replacing the OTD deadline.
+    """
     current_time = current_time or now_kz()
     a = raw_order.get("attributes") or {}
     delivery = a.get("kaspiDelivery") or {}
@@ -314,15 +329,25 @@ def parse_kaspi_order(raw_order, current_time=None):
     store_name = STORE_MAPPING.get(pickup_id, pickup_id or "Unknown Store")
     status = str(a.get("status") or "UNKNOWN")
 
-    planned = ts_to_dt(
+    courier_planned = ts_to_dt(
         a.get("courierTransmissionPlanningDate")
         or delivery.get("courierTransmissionPlanningDate")
     )
+    planned_delivery = ts_to_dt(a.get("plannedDeliveryDate"))
     actual = ts_to_dt(
         a.get("courierTransmissionDate")
         or delivery.get("courierTransmissionDate")
     )
     creation = ts_to_dt(a.get("creationDate"))
+
+    # Effective deadline is used only for persistent delay discovery/storage.
+    # Real OTD morning eligibility is controlled by courier_planning_date below.
+    effective_planned = courier_planned or planned_delivery
+    planning_source = (
+        "courierTransmissionPlanningDate"
+        if courier_planned
+        else ("plannedDeliveryDate_fallback" if planned_delivery else None)
+    )
 
     is_cancelled = status.upper() == "CANCELLED"
     was_delayed = False
@@ -331,18 +356,24 @@ def parse_kaspi_order(raw_order, current_time=None):
     delay_resolved = None
     delay_minutes = 0
 
-    if planned:
+    if effective_planned:
         if actual:
-            if actual > planned:
+            if actual > effective_planned:
                 was_delayed = True
-                delay_started = planned
+                delay_started = effective_planned
                 delay_resolved = actual
-                delay_minutes = max(0, int((actual - planned).total_seconds() // 60))
-        elif not is_cancelled and current_time > planned:
+                delay_minutes = max(
+                    0,
+                    int((actual - effective_planned).total_seconds() // 60),
+                )
+        elif not is_cancelled and current_time > effective_planned:
             was_delayed = True
             current_delay = True
-            delay_started = planned
-            delay_minutes = max(0, int((current_time - planned).total_seconds() // 60))
+            delay_started = effective_planned
+            delay_minutes = max(
+                0,
+                int((current_time - effective_planned).total_seconds() // 60),
+            )
 
     if is_cancelled:
         current_delay = False
@@ -352,7 +383,10 @@ def parse_kaspi_order(raw_order, current_time=None):
         "pickup_point_id": pickup_id,
         "store_name": store_name,
         "creation_date": creation,
-        "planned_transmission_date": planned,
+        "planned_transmission_date": effective_planned,
+        "courier_planning_date": courier_planned,
+        "planned_delivery_date": planned_delivery,
+        "planning_source": planning_source,
         "actual_transmission_date": actual,
         "current_status": status,
         "is_cancelled": is_cancelled,
@@ -483,20 +517,34 @@ def sync_current_orders(progress_callback=None):
 def create_morning_snapshot(report_date=None, force=False, progress_callback=None):
     report_date = report_date or today_kz()
 
+    # IMPORTANT:
+    # Always sync first. This discovers old overdue accepted orders even when
+    # today's immutable Morning Snapshot was already created by an earlier deploy.
+    parsed = sync_current_orders(progress_callback=progress_callback)
+
     existing = get_snapshot_count(report_date)
     if existing and not force:
-        logging.info("Morning snapshot already exists | %s | %s orders", report_date, existing)
+        logging.info(
+            "Morning snapshot already exists | %s | %s orders | current orders still synced",
+            report_date,
+            existing,
+        )
         return get_snapshot_orders(report_date), False
 
     started = time.perf_counter()
-    parsed = sync_current_orders(progress_callback=progress_callback)
 
+    # OTD snapshot uses ONLY courierTransmissionPlanningDate.
+    # plannedDeliveryDate fallback is intentionally not used for OTD denominator.
     today_orders = [
         o for o in parsed
-        if o.get("planned_transmission_date")
-        and o["planned_transmission_date"].astimezone(KZ_TZ).date() == report_date
+        if o.get("courier_planning_date")
+        and o["courier_planning_date"].astimezone(KZ_TZ).date() == report_date
         and not o.get("is_cancelled")
     ]
+
+    # Save the real courier plan into snapshot/DB for Morning OTD orders.
+    for o in today_orders:
+        o["planned_transmission_date"] = o["courier_planning_date"]
 
     id_map = bulk_save_orders(today_orders, write_history=False)
     bulk_save_morning_snapshot(report_date, today_orders, id_map)
@@ -1131,6 +1179,174 @@ def build_period_excel(start_date, end_date):
 
 
 # ============================================================
+# PNG TABLE SCREENSHOTS
+# ============================================================
+
+def _load_report_font(size=24, bold=False):
+    candidates = []
+    if bold:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        ])
+    else:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ])
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return ImageFont.truetype(candidate, size=size)
+    return ImageFont.load_default()
+
+
+def _draw_table_image(title, subtitle, headers, rows, filename, otd_column=None):
+    """
+    Creates a clean, saveable PNG report table for Telegram/email.
+    rows: list[list[str]]
+    otd_column: zero-based column index to apply OTD background colors.
+    """
+    title_font = _load_report_font(30, True)
+    subtitle_font = _load_report_font(20, False)
+    header_font = _load_report_font(19, True)
+    cell_font = _load_report_font(18, False)
+
+    padding_x = 18
+    padding_y = 13
+    row_height = 50
+    title_h = 100
+
+    # Estimate column widths from visible text.
+    col_widths = []
+    for col_idx, header in enumerate(headers):
+        candidates = [str(header)]
+        candidates.extend(str(r[col_idx]) if col_idx < len(r) else "" for r in rows)
+        max_chars = min(max(len(x) for x in candidates), 34)
+        width = max(115, min(390, max_chars * 11 + padding_x * 2))
+        col_widths.append(width)
+
+    table_width = sum(col_widths)
+    image_width = max(1100, table_width + 60)
+    image_height = title_h + row_height * (len(rows) + 1) + 50
+
+    img = Image.new("RGB", (image_width, image_height), "white")
+    draw = ImageDraw.Draw(img)
+
+    draw.text((30, 20), title, font=title_font, fill="#111827")
+    draw.text((30, 60), subtitle, font=subtitle_font, fill="#4B5563")
+
+    x0 = 30
+    y0 = title_h
+
+    # Header
+    x = x0
+    for i, header in enumerate(headers):
+        w = col_widths[i]
+        draw.rectangle((x, y0, x + w, y0 + row_height), fill="#1F4E78", outline="#D1D5DB")
+        draw.text((x + padding_x, y0 + padding_y), str(header), font=header_font, fill="white")
+        x += w
+
+    # Rows
+    y = y0 + row_height
+    for row_idx, row in enumerate(rows):
+        x = x0
+        base_fill = "#F8FAFC" if row_idx % 2 == 0 else "white"
+        for col_idx, value in enumerate(row):
+            w = col_widths[col_idx]
+            fill = base_fill
+            if otd_column is not None and col_idx == otd_column:
+                raw = str(value).replace("%", "").strip()
+                try:
+                    fill = f"#{otd_fill(float(raw))}"
+                except Exception:
+                    fill = base_fill
+            draw.rectangle((x, y, x + w, y + row_height), fill=fill, outline="#D1D5DB")
+            draw.text((x + padding_x, y + padding_y), str(value), font=cell_font, fill="#111827")
+            x += w
+        y += row_height
+
+    path = Path(tempfile.gettempdir()) / filename
+    img.save(path, format="PNG", optimize=True)
+    return path
+
+
+def build_morning_table_image(report_date):
+    snaps = get_snapshot_orders(report_date)
+    open_orders = get_open_delays()
+
+    planned = defaultdict(int)
+    previous = defaultdict(int)
+    for s in snaps:
+        planned[s["store_name"]] += 1
+    for o in open_orders:
+        p = o.get("planned_transmission_date")
+        if p and p.astimezone(KZ_TZ).date() < report_date:
+            previous[o["store_name"]] += 1
+
+    stores = sorted(set(planned) | set(previous))
+    rows = [
+        [store, planned[store], previous[store]]
+        for store in stores
+    ]
+    rows.append([
+        "TOTAL",
+        sum(planned.values()),
+        sum(previous.values()),
+    ])
+
+    return _draw_table_image(
+        "OMS KZ — Morning Report",
+        fmt_date(report_date),
+        ["Store", "Planned Today", "Previous Open Delays"],
+        rows,
+        f"Morning_Report_{report_date.isoformat()}.png",
+    )
+
+
+def build_daily_table_image(report_date):
+    report_rows = get_daily_otd(report_date)
+    total = summarize_rows(report_rows)
+
+    rows = []
+    for r in report_rows:
+        pct = r["otd_percent"]
+        pct_text = "N/A" if pct is None else f"{float(pct):.2f}%"
+        rows.append([
+            r["store_name"],
+            f"{r['morning_orders']} ({r['actual_orders']})",
+            r["on_time_orders"],
+            r["delayed_orders"],
+            pct_text,
+        ])
+
+    total_pct = total["otd_percent"]
+    rows.append([
+        "TOTAL",
+        f"{total['morning_orders']} ({total['actual_orders']})",
+        total["on_time_orders"],
+        total["delayed_orders"],
+        "N/A" if total_pct is None else f"{float(total_pct):.2f}%",
+    ])
+
+    return _draw_table_image(
+        "OMS KZ — Daily OTD",
+        fmt_date(report_date),
+        ["Store", "Orders", "On Time", "Delayed", "OTD"],
+        rows,
+        f"Daily_OTD_{report_date.isoformat()}.png",
+        otd_column=4,
+    )
+
+
+def send_report_photo(chat_id, path, caption=None):
+    with open(path, "rb") as photo:
+        bot.send_photo(
+            chat_id,
+            photo,
+            caption=caption,
+        )
+
+# ============================================================
 # EMAIL
 # ============================================================
 
@@ -1144,7 +1360,7 @@ def email_is_configured():
     return bool(EMAIL_FROM and EMAIL_PASSWORD and EMAIL_TO)
 
 
-def send_email(subject, html_body, attachment_path=None):
+def send_email(subject, html_body, attachment_paths=None):
     if not email_is_configured():
         raise RuntimeError("EMAIL_FROM / EMAIL_PASSWORD / EMAIL_TO are not fully configured")
 
@@ -1160,13 +1376,24 @@ def send_email(subject, html_body, attachment_path=None):
     msg.set_content("This email contains an HTML report.")
     msg.add_alternative(html_body, subtype="html")
 
-    if attachment_path:
+    for attachment_path in (attachment_paths or []):
         p = Path(attachment_path)
+        suffix = p.suffix.lower()
+        if suffix == ".xlsx":
+            maintype = "application"
+            subtype = "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif suffix == ".png":
+            maintype = "image"
+            subtype = "png"
+        else:
+            maintype = "application"
+            subtype = "octet-stream"
+
         with open(p, "rb") as f:
             msg.add_attachment(
                 f.read(),
-                maintype="application",
-                subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                maintype=maintype,
+                subtype=subtype,
                 filename=p.name,
             )
 
@@ -1288,33 +1515,37 @@ def daily_email_html(report_date):
 
 
 def send_morning_email(report_date):
-    path = build_morning_excel(report_date)
+    excel_path = build_morning_excel(report_date)
+    image_path = build_morning_table_image(report_date)
     try:
         send_email(
             f"OMS KZ | Morning Pending Report | {fmt_date(report_date)}",
             morning_email_html(report_date),
-            path,
+            [excel_path, image_path],
         )
     finally:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        for path in (excel_path, image_path):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def send_daily_email(report_date):
-    path = build_daily_excel(report_date)
+    excel_path = build_daily_excel(report_date)
+    image_path = build_daily_table_image(report_date)
     try:
         send_email(
             f"OMS KZ | Daily OTD Report | {fmt_date(report_date)}",
             daily_email_html(report_date),
-            path,
+            [excel_path, image_path],
         )
     finally:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        for path in (excel_path, image_path):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -1461,6 +1692,15 @@ def run_morning_for_chat(chat_id):
             f"Orders in snapshot: {len(snaps)}"
         )
         send_long_message(chat_id, morning_summary_text(today_kz()), reply_markup=morning_menu())
+        image_path = build_morning_table_image(today_kz())
+        try:
+            send_report_photo(
+                chat_id,
+                image_path,
+                caption=f"☀️ OMS KZ Morning Report | {fmt_date(today_kz())}",
+            )
+        finally:
+            image_path.unlink(missing_ok=True)
     except Exception as exc:
         logging.exception("Morning report failed")
         update_progress(progress, f"❌ Morning Report error\n{exc}")
@@ -1491,6 +1731,15 @@ def run_daily_for_chat(chat_id):
         elapsed = time.perf_counter() - started
         update_progress(progress, f"✅ Daily OTD ready in {elapsed:.1f}s")
         send_long_message(chat_id, daily_otd_text(today_kz()), reply_markup=daily_menu())
+        image_path = build_daily_table_image(today_kz())
+        try:
+            send_report_photo(
+                chat_id,
+                image_path,
+                caption=f"🌙 OMS KZ Daily OTD | {fmt_date(today_kz())}",
+            )
+        finally:
+            image_path.unlink(missing_ok=True)
     except Exception as exc:
         logging.exception("Daily OTD failed")
         update_progress(progress, f"❌ Daily OTD error\n{exc}")
@@ -1759,6 +2008,38 @@ def state_input(message):
 
 
 # ============================================================
+# BACKGROUND CURRENT-ORDER SYNC
+# ============================================================
+
+def background_sync_loop():
+    """
+    Keeps the DB current without making every Telegram button wait for Kaspi.
+    Open Delays / History / Store Report therefore read quickly from Supabase.
+    """
+    logging.info("Background sync started | every %s minutes", BACKGROUND_SYNC_MINUTES)
+
+    # Small startup delay lets Flask/webhook become ready first.
+    time.sleep(8)
+
+    while True:
+        if _report_lock.acquire(blocking=False):
+            try:
+                started = time.perf_counter()
+                sync_current_orders()
+                logging.info(
+                    "Background sync complete | %.2fs",
+                    time.perf_counter() - started,
+                )
+            except Exception:
+                logging.exception("Background sync failed")
+            finally:
+                _report_lock.release()
+        else:
+            logging.info("Background sync skipped: report is running")
+
+        time.sleep(BACKGROUND_SYNC_MINUTES * 60)
+
+# ============================================================
 # AUTOMATIC JOBS
 # ============================================================
 
@@ -1856,6 +2137,7 @@ if __name__ == "__main__":
         logging.error("Supabase connection failed: %s", info)
 
     threading.Thread(target=scheduler_loop, daemon=True).start()
+    threading.Thread(target=background_sync_loop, daemon=True).start()
 
     try:
         bot.remove_webhook()
