@@ -80,7 +80,7 @@ EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_TO = os.getenv("EMAIL_TO")
 EMAIL_CC = os.getenv("EMAIL_CC")
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.yandex.com")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 
 KASPI_URL = "https://kaspi.kz/shop/api/v2/orders"
